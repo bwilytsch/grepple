@@ -48,6 +48,8 @@ enum Commands {
         target: Option<String>,
     },
     Sessions {
+        #[command(subcommand)]
+        command: Option<SessionsCommands>,
         #[arg(long)]
         json: bool,
     },
@@ -108,6 +110,14 @@ enum Commands {
         command: ShellCommands,
     },
     Mcp,
+}
+
+#[derive(Subcommand, Debug)]
+enum SessionsCommands {
+    Clear {
+        #[arg(long, action = ArgAction::SetTrue)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -193,14 +203,28 @@ fn run() -> Result<()> {
                 meta.provider_ref.unwrap_or_default()
             );
         }
-        Commands::Sessions { json } => {
-            let sessions = app.list_sessions()?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&sessions)?);
-            } else {
-                print_sessions_table(&sessions);
+        Commands::Sessions { command, json } => match command {
+            Some(SessionsCommands::Clear { yes }) => {
+                if json {
+                    anyhow::bail!("--json is not supported for 'sessions clear'");
+                }
+                confirm_sessions_clear(yes)?;
+                let deleted = app.clear_sessions()?;
+                if deleted.is_empty() {
+                    println!("No sessions to clear.");
+                } else {
+                    println!("Cleared {} session(s).", deleted.len());
+                }
             }
-        }
+            None => {
+                let sessions = app.list_sessions()?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&sessions)?);
+                } else {
+                    print_sessions_table(&sessions);
+                }
+            }
+        },
         Commands::Logs {
             session_id,
             stream,
@@ -402,6 +426,26 @@ fn print_install_summary(out: &InstallerResult, configured_name: &str) {
         println!("Config: {}", path);
     }
     println!("Details: {}", out.details);
+}
+
+fn confirm_sessions_clear(yes: bool) -> Result<()> {
+    if yes {
+        return Ok(());
+    }
+
+    if !io::stdin().is_terminal() {
+        anyhow::bail!("sessions clear requires --yes in non-interactive mode");
+    }
+
+    eprint!("This will remove all local grepple sessions. Continue? [y/N]: ");
+    io::stderr().flush()?;
+    let mut line = String::new();
+    io::stdin().read_line(&mut line)?;
+    let accepted = matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes");
+    if !accepted {
+        anyhow::bail!("aborted");
+    }
+    Ok(())
 }
 
 fn print_shell_command(command: &ShellCommands) {

@@ -278,6 +278,10 @@ impl Grepple {
         self.store.cleanup_expired_sessions()
     }
 
+    pub fn clear_sessions(&self) -> Result<Vec<String>> {
+        self.store.clear_all_sessions()
+    }
+
     fn stream_path<'a>(&self, meta: &'a SessionMetadata, stream: &str) -> Result<&'a Path> {
         let p = match stream {
             "stdout" => Path::new(&meta.stdout_path),

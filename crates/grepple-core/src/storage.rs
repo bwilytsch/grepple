@@ -202,6 +202,21 @@ impl SessionStore {
         Ok(deleted)
     }
 
+    pub fn clear_all_sessions(&self) -> Result<Vec<String>> {
+        let mut deleted = Vec::new();
+        for entry in fs::read_dir(&self.sessions_dir)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let session_id = entry.file_name().to_string_lossy().to_string();
+            fs::remove_dir_all(entry.path())?;
+            deleted.push(session_id);
+        }
+        deleted.sort();
+        Ok(deleted)
+    }
+
     pub fn enforce_storage_limit(&self, max_bytes: u64) -> Result<Vec<String>> {
         if max_bytes == 0 {
             return Ok(Vec::new());
@@ -416,6 +431,25 @@ mod tests {
         assert_eq!(deleted, vec!["stopped".to_string()]);
         assert!(store.session_dir("running").exists());
         assert!(!store.session_dir("stopped").exists());
+
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn clear_all_sessions_removes_session_directories() {
+        let state_dir = temp_state_dir();
+        let store = SessionStore::new(state_dir.clone(), 7).expect("create store");
+
+        create_session(&store, "one", 64);
+        create_session(&store, "two", 64);
+        std::fs::write(store.sessions_dir.join("README.txt"), "not a session")
+            .expect("write non-dir");
+
+        let deleted = store.clear_all_sessions().expect("clear sessions");
+        assert_eq!(deleted, vec!["one".to_string(), "two".to_string()]);
+        assert!(!store.session_dir("one").exists());
+        assert!(!store.session_dir("two").exists());
+        assert!(store.sessions_dir.join("README.txt").exists());
 
         let _ = std::fs::remove_dir_all(state_dir);
     }

@@ -72,6 +72,12 @@ Stop a managed session:
 grepple stop <session_id>
 ```
 
+Clear all locally stored session snapshots/logs:
+
+```bash
+grepple sessions clear --yes
+```
+
 ## Shell Helpers
 
 Generate shell helpers for a short alias (`g`) and run wrapper (`gr`):
