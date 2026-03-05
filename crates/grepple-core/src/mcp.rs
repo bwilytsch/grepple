@@ -132,7 +132,7 @@ fn handle_tool_call(app: &Grepple, msg: &Value) -> Result<Value> {
     let caller_cwd = parse_caller_cwd(&args).or_else(|| std::env::current_dir().ok());
 
     let payload = match name {
-        "session_list" => json!(app.list_sessions()?),
+        "session_list" => json!({"sessions": app.list_sessions()?}),
         "session_status" => {
             let session_id = required_string(&args, "session_id")?;
             let (meta, warnings) = app.session_status(&session_id, caller_cwd.as_deref())?;
@@ -254,9 +254,15 @@ fn handle_tool_call(app: &Grepple, msg: &Value) -> Result<Value> {
         }
     };
 
-    Ok(
-        json!({"content":[{"type":"text","text": serde_json::to_string_pretty(&payload)?}], "structuredContent": payload}),
-    )
+    let structured = payload
+        .as_object()
+        .map(|_| payload.clone())
+        .unwrap_or_else(|| json!({ "result": payload }));
+
+    Ok(json!({
+        "content":[{"type":"text","text": serde_json::to_string_pretty(&structured)?}],
+        "structuredContent": structured
+    }))
 }
 
 fn required_string(value: &Value, key: &str) -> Result<String> {

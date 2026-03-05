@@ -61,9 +61,10 @@ pub fn start_managed_session(
     cmd.arg("-c").arg(&req.command);
     cmd.current_dir(&cwd);
 
-    for (key, value) in req.env {
+    for (key, value) in &req.env {
         cmd.env(key, value);
     }
+    apply_color_env_defaults(&mut cmd, &req.env);
 
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
@@ -220,6 +221,7 @@ pub fn attach_tmux_session(
     let output = Command::new("tmux")
         .arg("capture-pane")
         .arg("-p")
+        .arg("-e")
         .arg("-J")
         .arg("-S")
         .arg("-500")
@@ -577,4 +579,69 @@ fn mark_session_exited(
 enum MirrorTarget {
     Stdout,
     Stderr,
+}
+
+fn apply_color_env_defaults(cmd: &mut Command, user_env: &[(String, String)]) {
+    if has_env_key(user_env, "NO_COLOR") {
+        return;
+    }
+
+    // Managed sessions run over pipes, so many CLIs default to no color.
+    // Also clear inherited NO_COLOR unless the caller explicitly set it.
+    cmd.env_remove("NO_COLOR");
+
+    if !should_force_color(user_env) {
+        return;
+    }
+
+    set_env_if_absent(cmd, user_env, "CLICOLOR", "1");
+    set_env_if_absent(cmd, user_env, "CLICOLOR_FORCE", "1");
+    set_env_if_absent(cmd, user_env, "FORCE_COLOR", "1");
+    set_env_if_absent(cmd, user_env, "TERM", "xterm-256color");
+    set_env_if_absent(cmd, user_env, "COLORTERM", "truecolor");
+}
+
+fn set_env_if_absent(
+    cmd: &mut Command,
+    user_env: &[(String, String)],
+    key: &str,
+    value: &str,
+) {
+    if user_env.iter().any(|(k, _)| k == key) {
+        return;
+    }
+    if std::env::var_os(key).is_some() {
+        return;
+    }
+    cmd.env(key, value);
+}
+
+fn should_force_color(user_env: &[(String, String)]) -> bool {
+    if env_value(user_env, "TERM")
+        .as_deref()
+        .is_some_and(|term| term.eq_ignore_ascii_case("dumb"))
+    {
+        return false;
+    }
+
+    if env_value(user_env, "CLICOLOR").as_deref() == Some("0")
+        || env_value(user_env, "CLICOLOR_FORCE").as_deref() == Some("0")
+        || env_value(user_env, "FORCE_COLOR").as_deref() == Some("0")
+    {
+        return false;
+    }
+
+    true
+}
+
+fn has_env_key(user_env: &[(String, String)], key: &str) -> bool {
+    user_env.iter().any(|(k, _)| k == key)
+}
+
+fn env_value(user_env: &[(String, String)], key: &str) -> Option<String> {
+    user_env
+        .iter()
+        .rev()
+        .find_map(|(k, v)| if k == key { Some(v.clone()) } else { None })
+        .or_else(|| std::env::var(key).ok())
 }
