@@ -1,5 +1,8 @@
-use std::io::{self, BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::{
+    collections::BTreeMap,
+    io::{self, BufRead, BufReader, Write},
+    path::PathBuf,
+};
 
 use serde_json::{Value, json};
 
@@ -8,7 +11,7 @@ use crate::{
     error::{GreppleError, Result},
     model::{
         AttachSessionRequest, LogReadRequest, LogSearchRequest, StartSessionRequest,
-        StopSessionRequest,
+        StopSessionRequest, Warning,
     },
 };
 
@@ -17,6 +20,10 @@ enum Framing {
     ContentLength,
     JsonLine,
 }
+
+const MCP_LOG_DEFAULT_MAX_CHARS: usize = 12_000;
+const MCP_LOG_MIN_MAX_CHARS: usize = 128;
+const MCP_LOG_HARD_MAX_CHARS: usize = 200_000;
 
 pub fn serve_stdio(app: &Grepple) -> Result<()> {
     let stdin = io::stdin();
@@ -90,7 +97,7 @@ fn handle_request(app: &Grepple, msg: &Value) -> Result<Value> {
                 "title": "Grepple Terminal Log Observer",
                 "version": env!("CARGO_PKG_VERSION"),
             },
-            "instructions": "Use Grepple sessions to inspect runtime logs. Always check session status before deep log inspection: prefer the newest running/starting session and ignore older stopped sessions when an active newer one exists. Prefer log_read/log_search over shelling out.",
+            "instructions": "Use Grepple sessions to inspect runtime logs. Answer the user's question directly first (for yes/no questions, start with Yes or No). Keep the answer concise and include only the minimum evidence needed. Always check session status before deep log inspection: prefer the newest running/starting session and ignore older stopped sessions when an active newer one exists. Prefer log_read/log_search over shelling out.",
         })),
         "tools/list" => Ok(json!({"tools": tool_list()})),
         "prompts/list" => Ok(json!({"prompts": [
@@ -106,7 +113,7 @@ fn handle_request(app: &Grepple, msg: &Value) -> Result<Value> {
                     "role": "assistant",
                     "content": {
                         "type": "text",
-                        "text": "Call session_list first, then confirm the target with session_status. Prefer the newest running/starting session; if one exists, ignore older stopped sessions unless explicitly requested. Then use log_search and log_read incrementally by offsets."
+                        "text": "Call session_list first, then confirm the target with session_status. Prefer the newest running/starting session; if one exists, ignore older stopped sessions unless explicitly requested. Then use log_search and log_read incrementally by offsets. In the final response, answer the user's question in the first sentence (Yes/No when applicable), then add brief evidence."
                     }
                 }
             ]
@@ -178,7 +185,9 @@ fn handle_tool_call(app: &Grepple, msg: &Value) -> Result<Value> {
                 .get("max_bytes")
                 .and_then(Value::as_u64)
                 .unwrap_or(32_768) as usize;
-            let out = app.log_read(
+            let raw = args.get("raw").and_then(Value::as_bool).unwrap_or(false);
+            let text_max_chars = mcp_text_max_chars(&args);
+            let mut out = app.log_read(
                 LogReadRequest {
                     session_id,
                     stream,
@@ -187,6 +196,23 @@ fn handle_tool_call(app: &Grepple, msg: &Value) -> Result<Value> {
                 },
                 caller_cwd.as_deref(),
             )?;
+            let shaped = shape_log_text(&out.chunk, raw, text_max_chars, TruncateKeep::Start);
+            out.chunk = shaped.text;
+            if shaped.cleaned {
+                out.warnings.push(mcp_sanitized_warning(
+                    "chunk",
+                    shaped.original_chars,
+                    shaped.returned_chars,
+                ));
+            }
+            if shaped.truncated {
+                out.warnings.push(mcp_truncated_warning(
+                    "chunk",
+                    shaped.original_chars,
+                    shaped.returned_chars,
+                    text_max_chars,
+                ));
+            }
             json!(out)
         }
         "log_search" => {
@@ -198,6 +224,8 @@ fn handle_tool_call(app: &Grepple, msg: &Value) -> Result<Value> {
                 .get("case_sensitive")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
+            let raw = args.get("raw").and_then(Value::as_bool).unwrap_or(false);
+            let text_max_chars = mcp_text_max_chars(&args);
             let start_offset = args
                 .get("start_offset")
                 .and_then(Value::as_u64)
@@ -211,7 +239,7 @@ fn handle_tool_call(app: &Grepple, msg: &Value) -> Result<Value> {
                 .and_then(Value::as_u64)
                 .unwrap_or(100) as usize;
 
-            let out = app.log_search(
+            let mut out = app.log_search(
                 LogSearchRequest {
                     session_id,
                     stream,
@@ -224,13 +252,51 @@ fn handle_tool_call(app: &Grepple, msg: &Value) -> Result<Value> {
                 },
                 caller_cwd.as_deref(),
             )?;
+            let mut sanitized_count = 0usize;
+            let mut truncated_count = 0usize;
+            for m in &mut out.matches {
+                let shaped = shape_log_text(&m.line, raw, text_max_chars, TruncateKeep::Start);
+                if shaped.cleaned {
+                    sanitized_count += 1;
+                }
+                if shaped.truncated {
+                    truncated_count += 1;
+                }
+                m.line = shaped.text;
+            }
+            if sanitized_count > 0 {
+                out.warnings.push(mcp_count_warning(
+                    "OUTPUT_SANITIZED",
+                    "search match lines sanitized for MCP output",
+                    "sanitized_lines",
+                    sanitized_count,
+                ));
+            }
+            if truncated_count > 0 {
+                out.warnings.push(mcp_count_warning(
+                    "OUTPUT_TRUNCATED",
+                    "search match lines truncated for MCP output",
+                    "truncated_lines",
+                    truncated_count,
+                ));
+            }
             json!(out)
         }
         "log_tail" => {
             let session_id = required_string(&args, "session_id")?;
             let stream = optional_string(&args, "stream").unwrap_or_else(|| "combined".to_string());
             let lines = args.get("lines").and_then(Value::as_u64).unwrap_or(200) as usize;
-            json!({"tail": app.log_tail(&session_id, &stream, lines)?})
+            let raw = args.get("raw").and_then(Value::as_bool).unwrap_or(false);
+            let text_max_chars = mcp_text_max_chars(&args);
+            let tail = app.log_tail(&session_id, &stream, lines)?;
+            let shaped = shape_log_text(&tail, raw, text_max_chars, TruncateKeep::End);
+            json!({
+                "tail": shaped.text,
+                "tail_sanitized": shaped.cleaned,
+                "tail_truncated": shaped.truncated,
+                "tail_original_chars": shaped.original_chars,
+                "tail_returned_chars": shaped.returned_chars
+            })
         }
         "log_stats" => {
             let session_id = required_string(&args, "session_id")?;
@@ -344,7 +410,9 @@ fn tool_list() -> Vec<Value> {
                     "session_id": {"type":"string"},
                     "stream": {"type":"string", "enum": ["stdout", "stderr", "combined"]},
                     "offset": {"type":"number"},
-                    "max_bytes": {"type":"number"}
+                    "max_bytes": {"type":"number"},
+                    "max_chars": {"type":"number", "description": "max characters returned in chunk (default 12000)"},
+                    "raw": {"type":"boolean", "description": "if true, disable MCP sanitation/truncation"}
                 }
             }),
         ),
@@ -363,7 +431,9 @@ fn tool_list() -> Vec<Value> {
                     "case_sensitive": {"type":"boolean"},
                     "start_offset": {"type":"number"},
                     "max_scan_bytes": {"type":"number"},
-                    "max_matches": {"type":"number"}
+                    "max_matches": {"type":"number"},
+                    "max_chars": {"type":"number", "description": "max characters returned per match line (default 12000)"},
+                    "raw": {"type":"boolean", "description": "if true, disable MCP sanitation/truncation"}
                 }
             }),
         ),
@@ -371,7 +441,17 @@ fn tool_list() -> Vec<Value> {
             "log_tail",
             "Tail logs",
             "Read the last N lines from a stream",
-            json!({"type":"object", "required": ["session_id"], "properties": {"session_id": {"type":"string"}, "stream": {"type":"string"}, "lines": {"type":"number"}}}),
+            json!({
+                "type":"object",
+                "required": ["session_id"],
+                "properties": {
+                    "session_id": {"type":"string"},
+                    "stream": {"type":"string"},
+                    "lines": {"type":"number"},
+                    "max_chars": {"type":"number", "description": "max characters returned in tail (default 12000)"},
+                    "raw": {"type":"boolean", "description": "if true, disable MCP sanitation/truncation"}
+                }
+            }),
         ),
         tool(
             "log_stats",
@@ -498,9 +578,191 @@ pub fn parse_caller_cwd(args: &Value) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+fn mcp_text_max_chars(args: &Value) -> usize {
+    let raw = args
+        .get("max_chars")
+        .and_then(Value::as_u64)
+        .unwrap_or(MCP_LOG_DEFAULT_MAX_CHARS as u64);
+    raw.clamp(MCP_LOG_MIN_MAX_CHARS as u64, MCP_LOG_HARD_MAX_CHARS as u64) as usize
+}
+
+fn mcp_sanitized_warning(field: &str, original_chars: usize, returned_chars: usize) -> Warning {
+    let mut metadata = BTreeMap::new();
+    metadata.insert("field".to_string(), field.to_string());
+    metadata.insert("original_chars".to_string(), original_chars.to_string());
+    metadata.insert("returned_chars".to_string(), returned_chars.to_string());
+    Warning {
+        code: "OUTPUT_SANITIZED".to_string(),
+        message: "terminal control sequences removed for MCP output".to_string(),
+        metadata,
+    }
+}
+
+fn mcp_truncated_warning(
+    field: &str,
+    original_chars: usize,
+    returned_chars: usize,
+    max_chars: usize,
+) -> Warning {
+    let mut metadata = BTreeMap::new();
+    metadata.insert("field".to_string(), field.to_string());
+    metadata.insert("original_chars".to_string(), original_chars.to_string());
+    metadata.insert("returned_chars".to_string(), returned_chars.to_string());
+    metadata.insert("max_chars".to_string(), max_chars.to_string());
+    Warning {
+        code: "OUTPUT_TRUNCATED".to_string(),
+        message: "log output truncated for MCP response size".to_string(),
+        metadata,
+    }
+}
+
+fn mcp_count_warning(code: &str, message: &str, key: &str, count: usize) -> Warning {
+    let mut metadata = BTreeMap::new();
+    metadata.insert(key.to_string(), count.to_string());
+    Warning {
+        code: code.to_string(),
+        message: message.to_string(),
+        metadata,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum TruncateKeep {
+    Start,
+    End,
+}
+
+struct ShapedText {
+    text: String,
+    original_chars: usize,
+    returned_chars: usize,
+    cleaned: bool,
+    truncated: bool,
+}
+
+fn shape_log_text(input: &str, raw: bool, max_chars: usize, keep: TruncateKeep) -> ShapedText {
+    if raw {
+        let chars = input.chars().count();
+        return ShapedText {
+            text: input.to_string(),
+            original_chars: chars,
+            returned_chars: chars,
+            cleaned: false,
+            truncated: false,
+        };
+    }
+
+    let original_chars = input.chars().count();
+    let cleaned_text = strip_terminal_control(input);
+    let cleaned = cleaned_text != input;
+    let (text, truncated) = truncate_chars(&cleaned_text, max_chars, keep);
+    let returned_chars = text.chars().count();
+
+    ShapedText {
+        text,
+        original_chars,
+        returned_chars,
+        cleaned,
+        truncated,
+    }
+}
+
+fn truncate_chars(input: &str, max_chars: usize, keep: TruncateKeep) -> (String, bool) {
+    let total_chars = input.chars().count();
+    if total_chars <= max_chars {
+        return (input.to_string(), false);
+    }
+
+    match keep {
+        TruncateKeep::Start => {
+            let end_byte = input
+                .char_indices()
+                .nth(max_chars)
+                .map(|(idx, _)| idx)
+                .unwrap_or(input.len());
+            (input[..end_byte].to_string(), true)
+        }
+        TruncateKeep::End => {
+            let skip = total_chars - max_chars;
+            let start_byte = input
+                .char_indices()
+                .nth(skip)
+                .map(|(idx, _)| idx)
+                .unwrap_or(0);
+            (input[start_byte..].to_string(), true)
+        }
+    }
+}
+
+fn strip_terminal_control(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == 0x1b {
+            i += 1;
+            if i >= bytes.len() {
+                break;
+            }
+            match bytes[i] {
+                b'[' => {
+                    i += 1;
+                    while i < bytes.len() {
+                        let c = bytes[i];
+                        i += 1;
+                        if (0x40..=0x7e).contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                b']' => {
+                    i += 1;
+                    while i < bytes.len() {
+                        if bytes[i] == 0x07 {
+                            i += 1;
+                            break;
+                        }
+                        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
+                            i += 2;
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+                _ => {
+                    i += 1;
+                }
+            }
+            continue;
+        }
+
+        if b == b'\r' {
+            if i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
+                i += 1;
+                continue;
+            }
+            out.push(b'\n');
+            i += 1;
+            continue;
+        }
+
+        if b < 0x20 && b != b'\n' && b != b'\t' {
+            i += 1;
+            continue;
+        }
+
+        out.push(b);
+        i += 1;
+    }
+
+    String::from_utf8_lossy(&out).to_string()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::read_message;
+    use super::{TruncateKeep, read_message, shape_log_text, strip_terminal_control};
     use std::io::BufReader;
 
     #[test]
@@ -533,5 +795,23 @@ mod tests {
         assert!(matches!(framing, super::Framing::JsonLine));
         assert_eq!(msg["method"], "initialize");
         assert_eq!(msg["id"], 0);
+    }
+
+    #[test]
+    fn strip_terminal_control_removes_ansi_and_carriage_control() {
+        let raw = "\u{1b}[34mblue\u{1b}[0m\r\u{1b}[2Knext\nok";
+        let cleaned = strip_terminal_control(raw);
+        assert!(!cleaned.contains('\u{1b}'));
+        assert!(!cleaned.contains('\r'));
+        assert!(cleaned.contains("blue"));
+        assert!(cleaned.contains("next"));
+        assert!(cleaned.contains("ok"));
+    }
+
+    #[test]
+    fn shape_log_text_truncates_from_end_for_tail() {
+        let shaped = shape_log_text("1234567890", false, 4, TruncateKeep::End);
+        assert_eq!(shaped.text, "7890");
+        assert!(shaped.truncated);
     }
 }

@@ -601,12 +601,7 @@ fn apply_color_env_defaults(cmd: &mut Command, user_env: &[(String, String)]) {
     set_env_if_absent(cmd, user_env, "COLORTERM", "truecolor");
 }
 
-fn set_env_if_absent(
-    cmd: &mut Command,
-    user_env: &[(String, String)],
-    key: &str,
-    value: &str,
-) {
+fn set_env_if_absent(cmd: &mut Command, user_env: &[(String, String)], key: &str, value: &str) {
     if user_env.iter().any(|(k, _)| k == key) {
         return;
     }
