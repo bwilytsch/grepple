@@ -75,6 +75,9 @@ grepple install codex
 # grepple install codex --dry-run
 ```
 
+By default, `install/add` uses a terminal UI with progress and success/failure state.
+For machine-readable output, pass `--json`.
+
 Claude Code:
 
 ```bash
@@ -99,6 +102,21 @@ Or, if installed with `with-mcp-bin`:
 
 ```bash
 grepple-mcp
+```
+
+## Troubleshooting Codex Startup Timeout
+
+If Codex reports:
+
+```text
+MCP client for `grepple` timed out after 10 seconds
+```
+
+use a prebuilt binary command in your MCP config (`grepple mcp` or `grepple-mcp`), not `cargo run ...`, and optionally increase timeout:
+
+```toml
+[mcp_servers.grepple]
+startup_timeout_sec = 30
 ```
 
 Grepple MCP exposes these core tools:

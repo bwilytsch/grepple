@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+default-run = "grepple"
 
 [workspace]
 members = [
@@ -33,6 +34,8 @@ walkdir = "2.5"
 tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "signal", "process", "io-util", "sync", "time", "fs"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+crossterm = "0.29"
+ratatui = "0.29"
 
 [features]
 default = []
@@ -42,6 +45,8 @@ with-mcp-bin = []
 anyhow.workspace = true
 clap.workspace = true
 serde_json.workspace = true
+crossterm.workspace = true
+ratatui.workspace = true
 grepple-core = { path = "crates/grepple-core" }
 
 [[bin]]

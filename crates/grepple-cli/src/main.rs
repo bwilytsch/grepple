@@ -8,11 +8,13 @@ use clap::{ArgAction, Parser, Subcommand};
 use grepple_core::{
     Grepple, GreppleConfig, mcp,
     model::{
-        AttachSessionRequest, LogReadRequest, LogSearchRequest, StartSessionRequest,
-        StopSessionRequest,
+        AttachSessionRequest, InstallerResult, LogReadRequest, LogSearchRequest,
+        StartSessionRequest, StopSessionRequest,
     },
     runtime::list_tmux_panes,
 };
+
+mod tui;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -81,6 +83,8 @@ enum Commands {
         force: bool,
         #[arg(long, default_value = "user")]
         scope: String,
+        #[arg(long, action = ArgAction::SetTrue)]
+        json: bool,
     },
     Install {
         client: String,
@@ -94,6 +98,8 @@ enum Commands {
         force: bool,
         #[arg(long, default_value = "user")]
         scope: String,
+        #[arg(long, action = ArgAction::SetTrue)]
+        json: bool,
     },
     Mcp,
 }
@@ -109,6 +115,13 @@ fn main() -> ExitCode {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
+
+    if matches!(&cli.command, Commands::Mcp) {
+        let app = Grepple::new_for_mcp(GreppleConfig::default())?;
+        mcp::serve_stdio(&app).context("running MCP server")?;
+        return Ok(());
+    }
+
     let app = Grepple::new(GreppleConfig::default())?;
 
     match cli.command {
@@ -149,15 +162,7 @@ fn run() -> Result<()> {
             if json {
                 println!("{}", serde_json::to_string_pretty(&sessions)?);
             } else {
-                for session in sessions {
-                    println!(
-                        "{}  {:<10}  {:<34}  {}",
-                        session.session_id,
-                        format!("{:?}", session.status).to_lowercase(),
-                        session.display_name,
-                        session.summary_last_line.unwrap_or_default()
-                    );
-                }
+                print_sessions_table(&sessions);
             }
         }
         Commands::Logs {
@@ -223,6 +228,7 @@ fn run() -> Result<()> {
             dry_run,
             force,
             scope,
+            json,
         }
         | Commands::Install {
             client,
@@ -231,17 +237,31 @@ fn run() -> Result<()> {
             dry_run,
             force,
             scope,
+            json,
         } => {
             let env = parse_env_pairs(env)?;
-            let out = app.install_client(&client, &name, &env, dry_run, force, &scope)?;
-            println!("{}", serde_json::to_string_pretty(&out)?);
+            let use_line_ui = !dry_run && !json && std::io::stdout().is_terminal();
+            let out = if use_line_ui {
+                tui::run_install_tui(tui::InstallUiRequest {
+                    client: client.clone(),
+                    name: name.clone(),
+                    env: env.clone(),
+                    force,
+                    scope: scope.clone(),
+                })?
+            } else {
+                app.install_client(&client, &name, &env, dry_run, force, &scope)?
+            };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&out)?);
+            } else if !use_line_ui {
+                print_install_summary(&out, &name);
+            }
             if !out.success {
                 anyhow::bail!("installer failed: {}", out.details);
             }
         }
-        Commands::Mcp => {
-            mcp::serve_stdio(&app).context("running MCP server")?;
-        }
+        Commands::Mcp => unreachable!("handled before app initialization"),
     }
 
     Ok(())
@@ -322,4 +342,85 @@ fn resolve_attach_target(target: Option<String>) -> Result<Option<String>> {
     }
 
     Ok(Some(panes[choice - 1].pane_id.clone()))
+}
+
+fn print_install_summary(out: &InstallerResult, configured_name: &str) {
+    if out.success {
+        if out.dry_run {
+            println!("Dry run for {} complete.", out.client);
+        } else {
+            println!(
+                "Installed Grepple MCP for {} as '{}'.",
+                out.client, configured_name
+            );
+        }
+    } else {
+        println!("Grepple MCP install failed for {}.", out.client);
+    }
+
+    if let Some(preview) = &out.plan.command_preview {
+        println!("Command: {}", preview);
+    }
+    if let Some(path) = &out.plan.config_path {
+        println!("Config: {}", path);
+    }
+    println!("Details: {}", out.details);
+}
+
+fn print_sessions_table(sessions: &[grepple_core::model::SessionMetadata]) {
+    if sessions.is_empty() {
+        println!("No sessions found.");
+        return;
+    }
+
+    const ID_W: usize = 26;
+    const STATUS_W: usize = 10;
+    const PROVIDER_W: usize = 12;
+    const NAME_W: usize = 28;
+    const BRANCH_W: usize = 18;
+    const LAST_W: usize = 54;
+
+    let total_w = ID_W + STATUS_W + PROVIDER_W + NAME_W + BRANCH_W + LAST_W + 5;
+    println!("SESSIONS");
+    println!("{}", "-".repeat(total_w));
+    println!(
+        "{:<ID_W$} {:<STATUS_W$} {:<PROVIDER_W$} {:<NAME_W$} {:<BRANCH_W$} {:<LAST_W$}",
+        "SESSION ID", "STATUS", "PROVIDER", "NAME", "BRANCH", "LAST LINE"
+    );
+    println!("{}", "-".repeat(total_w));
+
+    for session in sessions {
+        let status = format!("{:?}", session.status).to_lowercase();
+        let provider = format!("{:?}", session.provider).to_lowercase();
+        let branch = session
+            .git_context
+            .as_ref()
+            .map(|g| g.branch.as_str())
+            .unwrap_or("-");
+        let last = session.summary_last_line.as_deref().unwrap_or("-");
+
+        println!(
+            "{:<ID_W$} {:<STATUS_W$} {:<PROVIDER_W$} {:<NAME_W$} {:<BRANCH_W$} {:<LAST_W$}",
+            truncate(&session.session_id, ID_W),
+            truncate(&status, STATUS_W),
+            truncate(&provider, PROVIDER_W),
+            truncate(&session.display_name, NAME_W),
+            truncate(branch, BRANCH_W),
+            truncate(last, LAST_W),
+        );
+    }
+}
+
+fn truncate(value: &str, max: usize) -> String {
+    if value.chars().count() <= max {
+        return value.to_string();
+    }
+
+    let keep = max.saturating_sub(3);
+    let mut out = String::new();
+    for ch in value.chars().take(keep) {
+        out.push(ch);
+    }
+    out.push_str("...");
+    out
 }

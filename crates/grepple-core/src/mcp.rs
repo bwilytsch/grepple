@@ -434,7 +434,7 @@ fn write_message<W: Write>(writer: &mut W, value: &Value) -> Result<()> {
 
 pub fn run_from_default_config() -> Result<()> {
     let config = crate::app::GreppleConfig::default();
-    let app = crate::app::Grepple::new(config)?;
+    let app = crate::app::Grepple::new_for_mcp(config)?;
     serve_stdio(&app)
 }
 

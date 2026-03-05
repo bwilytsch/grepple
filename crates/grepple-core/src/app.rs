@@ -74,6 +74,14 @@ pub struct Grepple {
 
 impl Grepple {
     pub fn new(config: GreppleConfig) -> Result<Self> {
+        Self::new_with_cleanup(config, true)
+    }
+
+    pub fn new_for_mcp(config: GreppleConfig) -> Result<Self> {
+        Self::new_with_cleanup(config, false)
+    }
+
+    fn new_with_cleanup(config: GreppleConfig, run_startup_cleanup: bool) -> Result<Self> {
         let store = match SessionStore::new(config.state_dir.clone(), config.ttl_days) {
             Ok(store) => store,
             Err(err) => {
@@ -92,7 +100,9 @@ impl Grepple {
             }
         };
         let app = Self { config, store };
-        let _ = app.store.cleanup_expired_sessions();
+        if run_startup_cleanup {
+            let _ = app.store.cleanup_expired_sessions();
+        }
         Ok(app)
     }
 
