@@ -36,6 +36,8 @@ enum Commands {
         cwd: Option<String>,
         #[arg(long = "env", value_name = "KEY=VALUE")]
         env: Vec<String>,
+        #[arg(long, action = ArgAction::SetTrue)]
+        detached: bool,
         #[arg(required = true, trailing_var_arg = true)]
         command: Vec<String>,
     },
@@ -129,6 +131,7 @@ fn run() -> Result<()> {
             name,
             cwd,
             env,
+            detached,
             command,
         } => {
             let command = shell_join(&command);
@@ -138,14 +141,22 @@ fn run() -> Result<()> {
                 cwd,
                 command,
                 env,
+                foreground: !detached,
             })?;
-            println!(
-                "started {} ({}) pid={} status={:?}",
-                meta.session_id,
-                meta.display_name,
-                meta.pid.unwrap_or_default(),
-                meta.status
-            );
+            if detached {
+                println!(
+                    "started {} ({}) pid={} status={:?}",
+                    meta.session_id,
+                    meta.display_name,
+                    meta.pid.unwrap_or_default(),
+                    meta.status
+                );
+            } else if meta.exit_code.unwrap_or_default() != 0 {
+                return Err(anyhow::anyhow!(
+                    "command exited with status {}",
+                    meta.exit_code.unwrap_or_default()
+                ));
+            }
         }
         Commands::Attach { name, target } => {
             let target = resolve_attach_target(target)?;

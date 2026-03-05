@@ -90,7 +90,7 @@ fn handle_request(app: &Grepple, msg: &Value) -> Result<Value> {
                 "title": "Grepple Terminal Log Observer",
                 "version": env!("CARGO_PKG_VERSION"),
             },
-            "instructions": "Use Grepple sessions to inspect runtime logs. Prefer log_read/log_search over shelling out.",
+            "instructions": "Use Grepple sessions to inspect runtime logs. Always check session status before deep log inspection: prefer the newest running/starting session and ignore older stopped sessions when an active newer one exists. Prefer log_read/log_search over shelling out.",
         })),
         "tools/list" => Ok(json!({"tools": tool_list()})),
         "prompts/list" => Ok(json!({"prompts": [
@@ -106,7 +106,7 @@ fn handle_request(app: &Grepple, msg: &Value) -> Result<Value> {
                     "role": "assistant",
                     "content": {
                         "type": "text",
-                        "text": "Call session_list first, pick likely session by name/status/last line, then use log_search and log_read incrementally by offsets."
+                        "text": "Call session_list first, then confirm the target with session_status. Prefer the newest running/starting session; if one exists, ignore older stopped sessions unless explicitly requested. Then use log_search and log_read incrementally by offsets."
                     }
                 }
             ]
@@ -148,6 +148,7 @@ fn handle_tool_call(app: &Grepple, msg: &Value) -> Result<Value> {
                 cwd,
                 command,
                 env,
+                foreground: false,
             })?;
             json!(started)
         }
@@ -419,7 +420,10 @@ fn read_message<R: BufRead>(reader: &mut R) -> Result<Option<(Value, Framing)>> 
 
     let trimmed = first_line.trim();
     if trimmed.starts_with('{') || trimmed.starts_with('[') {
-        return Ok(Some((serde_json::from_str::<Value>(trimmed)?, Framing::JsonLine)));
+        return Ok(Some((
+            serde_json::from_str::<Value>(trimmed)?,
+            Framing::JsonLine,
+        )));
     }
 
     let mut content_length: Option<usize> = parse_content_length_header(&first_line)?;

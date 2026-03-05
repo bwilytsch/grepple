@@ -98,6 +98,7 @@ pub struct StartSessionRequest {
     pub cwd: Option<String>,
     pub command: String,
     pub env: Vec<(String, String)>,
+    pub foreground: bool,
 }
 
 #[derive(Debug, Clone)]

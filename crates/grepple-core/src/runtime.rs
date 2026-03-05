@@ -3,7 +3,7 @@ use std::{
     fs::OpenOptions,
     io::{Read, Write},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Command, ExitStatus, Stdio},
     sync::{Arc, Mutex},
     thread,
     time::Duration,
@@ -89,15 +89,25 @@ pub fn start_managed_session(
         .append(true)
         .open(&combined_path)?;
     let combined_writer = Arc::new(Mutex::new(combined_file));
-    spawn_stream_pump(
+    let stdout_pump = spawn_stream_pump(
         stdout_reader,
         stdout_path.clone(),
         Arc::clone(&combined_writer),
+        if req.foreground {
+            Some(MirrorTarget::Stdout)
+        } else {
+            None
+        },
     );
-    spawn_stream_pump(
+    let stderr_pump = spawn_stream_pump(
         stderr_reader,
         stderr_path.clone(),
         Arc::clone(&combined_writer),
+        if req.foreground {
+            Some(MirrorTarget::Stderr)
+        } else {
+            None
+        },
     );
 
     // Append deterministic start markers.
@@ -150,35 +160,23 @@ pub fn start_managed_session(
         }),
     )?;
 
+    if req.foreground {
+        let status = child.wait()?;
+        let _ = stdout_pump.join();
+        let _ = stderr_pump.join();
+        let meta = mark_session_exited(store, &session_id, status)?;
+        return Ok(meta);
+    }
+
     let store_for_wait = store.clone();
     let wait_session_id = session_id.clone();
+    let stdout_wait = stdout_pump;
+    let stderr_wait = stderr_pump;
     thread::spawn(move || {
         if let Ok(status) = child.wait() {
-            if let Ok(mut meta) = store_for_wait.read_meta(&wait_session_id) {
-                meta.exit_code = status.code();
-                if matches!(
-                    meta.status,
-                    SessionStatus::Running | SessionStatus::Starting
-                ) {
-                    meta.status = SessionStatus::Stopped;
-                    meta.stopped_at = Some(Utc::now());
-                    meta.updated_at = Utc::now();
-                    meta.last_activity_at = Utc::now();
-                    meta.summary_last_line = store_for_wait
-                        .update_summary_from_combined(&wait_session_id)
-                        .ok()
-                        .flatten();
-                    let _ = store_for_wait.write_meta(&meta);
-                    let _ = store_for_wait.append_event(
-                        &wait_session_id,
-                        "session_exited",
-                        json!({
-                            "exit_code": meta.exit_code,
-                            "success": status.success(),
-                        }),
-                    );
-                }
-            }
+            let _ = stdout_wait.join();
+            let _ = stderr_wait.join();
+            let _ = mark_session_exited(&store_for_wait, &wait_session_id, status);
         }
     });
 
@@ -499,7 +497,8 @@ fn spawn_stream_pump<R: Read + Send + 'static>(
     mut reader: R,
     stream_path: PathBuf,
     combined: Arc<Mutex<std::fs::File>>,
-) {
+    mirror: Option<MirrorTarget>,
+) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut stream_file = match OpenOptions::new().append(true).open(stream_path) {
             Ok(file) => file,
@@ -519,6 +518,21 @@ fn spawn_stream_pump<R: Read + Send + 'static>(
                 break;
             }
 
+            if let Some(target) = mirror {
+                match target {
+                    MirrorTarget::Stdout => {
+                        let mut out = std::io::stdout();
+                        let _ = out.write_all(chunk);
+                        let _ = out.flush();
+                    }
+                    MirrorTarget::Stderr => {
+                        let mut out = std::io::stderr();
+                        let _ = out.write_all(chunk);
+                        let _ = out.flush();
+                    }
+                }
+            }
+
             if let Ok(mut combined_file) = combined.lock() {
                 if combined_file.write_all(chunk).is_err() {
                     break;
@@ -527,5 +541,40 @@ fn spawn_stream_pump<R: Read + Send + 'static>(
                 break;
             }
         }
-    });
+    })
+}
+
+fn mark_session_exited(
+    store: &SessionStore,
+    session_id: &str,
+    status: ExitStatus,
+) -> Result<SessionMetadata> {
+    let mut meta = store.read_meta(session_id)?;
+    meta.exit_code = status.code();
+    if matches!(
+        meta.status,
+        SessionStatus::Running | SessionStatus::Starting
+    ) {
+        meta.status = SessionStatus::Stopped;
+        meta.stopped_at = Some(Utc::now());
+        meta.updated_at = Utc::now();
+        meta.last_activity_at = Utc::now();
+        meta.summary_last_line = store.update_summary_from_combined(session_id)?;
+        store.write_meta(&meta)?;
+        store.append_event(
+            session_id,
+            "session_exited",
+            json!({
+                "exit_code": meta.exit_code,
+                "success": status.success(),
+            }),
+        )?;
+    }
+    Ok(meta)
+}
+
+#[derive(Clone, Copy)]
+enum MirrorTarget {
+    Stdout,
+    Stderr,
 }

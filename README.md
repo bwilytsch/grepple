@@ -41,6 +41,13 @@ Run a command under Grepple:
 grepple run --name api -- pnpm dev
 ```
 
+By default, `grepple run` mirrors stdout/stderr to your terminal (like running the command directly)
+while still capturing logs for Grepple tools. To start in background mode instead:
+
+```bash
+grepple run --detached --name api -- pnpm dev
+```
+
 List sessions:
 
 ```bash
