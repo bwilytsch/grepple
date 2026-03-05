@@ -143,4 +143,5 @@ Grepple MCP exposes these core tools:
 ## Environment Variables
 
 - `GREPPLE_STATE_DIR`: override state directory
+- `GREPPLE_MAX_STATE_BYTES`: hard cap for total grepple state size in bytes (default `2147483648`; set `0` to disable cap)
 - `GREPPLE_REDACT=0`: disable output redaction in `log_read/log_search/log_tail`

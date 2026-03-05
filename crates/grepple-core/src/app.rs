@@ -26,6 +26,7 @@ use crate::{
 pub struct GreppleConfig {
     pub state_dir: PathBuf,
     pub ttl_days: i64,
+    pub max_state_bytes: Option<u64>,
     pub compact_tail_lines: usize,
     pub archive_full_logs: bool,
     pub max_read_bytes: usize,
@@ -54,6 +55,11 @@ impl Default for GreppleConfig {
         Self {
             state_dir,
             ttl_days: 7,
+            max_state_bytes: std::env::var("GREPPLE_MAX_STATE_BYTES")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .and_then(|v| if v == 0 { None } else { Some(v) })
+                .or(Some(2 * 1024 * 1024 * 1024)),
             compact_tail_lines: 10_000,
             archive_full_logs: true,
             max_read_bytes: 256 * 1024,
@@ -78,7 +84,7 @@ impl Grepple {
     }
 
     pub fn new_for_mcp(config: GreppleConfig) -> Result<Self> {
-        Self::new_with_cleanup(config, false)
+        Self::new_with_cleanup(config, true)
     }
 
     fn new_with_cleanup(config: GreppleConfig, run_startup_cleanup: bool) -> Result<Self> {
@@ -102,6 +108,9 @@ impl Grepple {
         let app = Self { config, store };
         if run_startup_cleanup {
             let _ = app.store.cleanup_expired_sessions();
+            if let Some(max_state_bytes) = app.config.max_state_bytes {
+                let _ = app.store.enforce_storage_limit(max_state_bytes);
+            }
         }
         Ok(app)
     }
@@ -150,6 +159,9 @@ impl Grepple {
         meta.summary_last_line = self.store.update_summary_from_combined(&meta.session_id)?;
         meta.updated_at = Utc::now();
         self.store.write_meta(&meta)?;
+        if let Some(max_state_bytes) = self.config.max_state_bytes {
+            let _ = self.store.enforce_storage_limit(max_state_bytes);
+        }
         Ok(meta)
     }
 
