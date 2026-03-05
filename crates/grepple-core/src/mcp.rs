@@ -12,6 +12,12 @@ use crate::{
     },
 };
 
+#[derive(Debug, Clone, Copy)]
+enum Framing {
+    ContentLength,
+    JsonLine,
+}
+
 pub fn serve_stdio(app: &Grepple) -> Result<()> {
     let stdin = io::stdin();
     let stdout = io::stdout();
@@ -19,7 +25,7 @@ pub fn serve_stdio(app: &Grepple) -> Result<()> {
     let mut writer = stdout.lock();
 
     loop {
-        let Some(msg) = read_message(&mut reader)? else {
+        let Some((msg, framing)) = read_message(&mut reader)? else {
             break;
         };
 
@@ -58,7 +64,7 @@ pub fn serve_stdio(app: &Grepple) -> Result<()> {
         };
 
         if let Some(response) = response {
-            write_message(&mut writer, &response)?;
+            write_message(&mut writer, &response, framing)?;
             writer.flush()?;
         }
     }
@@ -395,24 +401,39 @@ fn tool(name: &str, title: &str, description: &str, input_schema: Value) -> Valu
     })
 }
 
-fn read_message<R: BufRead>(reader: &mut R) -> Result<Option<Value>> {
-    let mut content_length: Option<usize> = None;
+fn read_message<R: BufRead>(reader: &mut R) -> Result<Option<(Value, Framing)>> {
+    let mut first_line = String::new();
+    let mut n = reader.read_line(&mut first_line)?;
+    if n == 0 {
+        return Ok(None);
+    }
+
+    // Support JSONL-style MCP transports that send one JSON-RPC payload per line.
+    while first_line.trim().is_empty() {
+        first_line.clear();
+        n = reader.read_line(&mut first_line)?;
+        if n == 0 {
+            return Ok(None);
+        }
+    }
+
+    let trimmed = first_line.trim();
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        return Ok(Some((serde_json::from_str::<Value>(trimmed)?, Framing::JsonLine)));
+    }
+
+    let mut content_length: Option<usize> = parse_content_length_header(&first_line)?;
     loop {
         let mut line = String::new();
         let n = reader.read_line(&mut line)?;
         if n == 0 {
-            return Ok(None);
+            break;
         }
         if line == "\r\n" || line == "\n" {
             break;
         }
 
-        let lower = line.to_ascii_lowercase();
-        if let Some(value) = lower.strip_prefix("content-length:") {
-            let parsed = value
-                .trim()
-                .parse::<usize>()
-                .map_err(|e| GreppleError::Tool(format!("invalid content-length: {e}")))?;
+        if let Some(parsed) = parse_content_length_header(&line)? {
             content_length = Some(parsed);
         }
     }
@@ -422,13 +443,36 @@ fn read_message<R: BufRead>(reader: &mut R) -> Result<Option<Value>> {
     let mut body = vec![0_u8; len];
     reader.read_exact(&mut body)?;
     let value = serde_json::from_slice::<Value>(&body)?;
-    Ok(Some(value))
+    Ok(Some((value, Framing::ContentLength)))
 }
 
-fn write_message<W: Write>(writer: &mut W, value: &Value) -> Result<()> {
+fn parse_content_length_header(line: &str) -> Result<Option<usize>> {
+    let line = line.trim_end_matches(&['\r', '\n'][..]);
+    let Some((name, value)) = line.split_once(':') else {
+        return Ok(None);
+    };
+    if !name.trim().eq_ignore_ascii_case("content-length") {
+        return Ok(None);
+    }
+    let parsed = value
+        .trim()
+        .parse::<usize>()
+        .map_err(|e| GreppleError::Tool(format!("invalid content-length: {e}")))?;
+    Ok(Some(parsed))
+}
+
+fn write_message<W: Write>(writer: &mut W, value: &Value, framing: Framing) -> Result<()> {
     let body = serde_json::to_vec(value)?;
-    write!(writer, "Content-Length: {}\r\n\r\n", body.len())?;
-    writer.write_all(&body)?;
+    match framing {
+        Framing::ContentLength => {
+            write!(writer, "Content-Length: {}\r\n\r\n", body.len())?;
+            writer.write_all(&body)?;
+        }
+        Framing::JsonLine => {
+            writer.write_all(&body)?;
+            writer.write_all(b"\n")?;
+        }
+    }
     Ok(())
 }
 
@@ -442,4 +486,42 @@ pub fn parse_caller_cwd(args: &Value) -> Option<PathBuf> {
     args.get("caller_cwd")
         .and_then(Value::as_str)
         .map(PathBuf::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_message;
+    use std::io::BufReader;
+
+    #[test]
+    fn read_message_accepts_content_length_framing() {
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+        let input = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
+        let mut reader = BufReader::new(input.as_bytes());
+
+        let parsed = read_message(&mut reader)
+            .expect("read should succeed")
+            .expect("message should exist");
+
+        let (msg, framing) = parsed;
+        assert!(matches!(framing, super::Framing::ContentLength));
+        assert_eq!(msg["method"], "initialize");
+        assert_eq!(msg["id"], 1);
+    }
+
+    #[test]
+    fn read_message_accepts_jsonl_framing() {
+        let input = r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}
+"#;
+        let mut reader = BufReader::new(input.as_bytes());
+
+        let parsed = read_message(&mut reader)
+            .expect("read should succeed")
+            .expect("message should exist");
+
+        let (msg, framing) = parsed;
+        assert!(matches!(framing, super::Framing::JsonLine));
+        assert_eq!(msg["method"], "initialize");
+        assert_eq!(msg["id"], 0);
+    }
 }

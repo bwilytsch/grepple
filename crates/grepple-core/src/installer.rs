@@ -2,6 +2,7 @@ use std::{collections::BTreeMap, fs, path::PathBuf, process::Command};
 
 use chrono::Utc;
 use serde_json::{Value, json};
+use toml_edit::{DocumentMut, Item, Table, value};
 
 use crate::{
     error::{GreppleError, Result},
@@ -57,6 +58,8 @@ pub fn install(req: InstallRequest) -> Result<InstallerResult> {
 }
 
 fn install_codex(req: InstallRequest) -> Result<InstallerResult> {
+    const DEFAULT_STARTUP_TIMEOUT_SEC: i64 = 30;
+
     let mut preview = format!("codex mcp add {}", req.name);
     for (k, v) in &req.env {
         preview.push_str(&format!(" --env {}={}", k, v));
@@ -80,9 +83,10 @@ fn install_codex(req: InstallRequest) -> Result<InstallerResult> {
         });
     }
 
+    let server_name = req.name.clone();
     let mut cmd = Command::new("codex");
-    cmd.arg("mcp").arg("add").arg(req.name);
-    for (k, v) in req.env {
+    cmd.arg("mcp").arg("add").arg(&server_name);
+    for (k, v) in &req.env {
         cmd.arg("--env").arg(format!("{}={}", k, v));
     }
     cmd.arg("--").arg("grepple").arg("mcp");
@@ -90,7 +94,14 @@ fn install_codex(req: InstallRequest) -> Result<InstallerResult> {
 
     let success = output.status.success();
     let details = if success {
-        "codex mcp add succeeded".to_string()
+        match set_codex_startup_timeout(&server_name, DEFAULT_STARTUP_TIMEOUT_SEC) {
+            Ok(()) => format!(
+                "codex mcp add succeeded (startup_timeout_sec={DEFAULT_STARTUP_TIMEOUT_SEC})"
+            ),
+            Err(err) => format!(
+                "codex mcp add succeeded, but failed to set startup_timeout_sec={DEFAULT_STARTUP_TIMEOUT_SEC}: {err}"
+            ),
+        }
     } else {
         String::from_utf8_lossy(&output.stderr).to_string()
     };
@@ -102,6 +113,48 @@ fn install_codex(req: InstallRequest) -> Result<InstallerResult> {
         success,
         details,
     })
+}
+
+fn set_codex_startup_timeout(server_name: &str, timeout_sec: i64) -> Result<()> {
+    let config_path = codex_config_path();
+    let content = if config_path.exists() {
+        fs::read_to_string(&config_path)?
+    } else {
+        String::new()
+    };
+
+    let mut doc = if content.trim().is_empty() {
+        DocumentMut::new()
+    } else {
+        content
+            .parse::<DocumentMut>()
+            .map_err(|e| GreppleError::Tool(format!("invalid codex toml config: {e}")))?
+    };
+
+    if !doc["mcp_servers"].is_table() {
+        doc["mcp_servers"] = Item::Table(Table::new());
+    }
+    if !doc["mcp_servers"][server_name].is_table() {
+        doc["mcp_servers"][server_name] = Item::Table(Table::new());
+    }
+
+    doc["mcp_servers"][server_name]["startup_timeout_sec"] = value(timeout_sec);
+
+    let parent = config_path
+        .parent()
+        .ok_or_else(|| GreppleError::Tool("invalid codex config path".to_string()))?;
+    fs::create_dir_all(parent)?;
+    let tmp = config_path.with_extension("tmp");
+    fs::write(&tmp, doc.to_string())?;
+    fs::rename(&tmp, &config_path)?;
+    Ok(())
+}
+
+fn codex_config_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("~"))
+        .join(".codex")
+        .join("config.toml")
 }
 
 fn install_claude(req: InstallRequest) -> Result<InstallerResult> {

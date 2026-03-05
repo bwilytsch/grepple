@@ -75,6 +75,8 @@ grepple install codex
 # grepple install codex --dry-run
 ```
 
+`grepple install codex` also sets `startup_timeout_sec = 30` for the installed MCP entry in `~/.codex/config.toml`.
+
 By default, `install/add` uses a terminal UI with progress and success/failure state.
 For machine-readable output, pass `--json`.
 
@@ -112,7 +114,7 @@ If Codex reports:
 MCP client for `grepple` timed out after 10 seconds
 ```
 
-use a prebuilt binary command in your MCP config (`grepple mcp` or `grepple-mcp`), not `cargo run ...`, and optionally increase timeout:
+use a prebuilt binary command in your MCP config (`grepple mcp` or `grepple-mcp`), not `cargo run ...`, and ensure timeout is set (the installer now sets this automatically for Codex):
 
 ```toml
 [mcp_servers.grepple]

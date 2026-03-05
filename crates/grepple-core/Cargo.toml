@@ -15,4 +15,5 @@ ulid.workspace = true
 dirs.workspace = true
 regex.workspace = true
 walkdir.workspace = true
+toml_edit.workspace = true
 libc = "0.2"
