@@ -4,7 +4,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use clap::{ArgAction, Parser, Subcommand};
+use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use grepple_core::{
     Grepple, GreppleConfig, mcp,
     model::{
@@ -103,7 +103,25 @@ enum Commands {
         #[arg(long, action = ArgAction::SetTrue)]
         json: bool,
     },
+    Shell {
+        #[command(subcommand)]
+        command: ShellCommands,
+    },
     Mcp,
+}
+
+#[derive(Subcommand, Debug)]
+enum ShellCommands {
+    Init {
+        #[arg(value_enum)]
+        shell: ShellFlavor,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+enum ShellFlavor {
+    Zsh,
+    Fish,
 }
 
 fn main() -> ExitCode {
@@ -118,10 +136,17 @@ fn main() -> ExitCode {
 fn run() -> Result<()> {
     let cli = Cli::parse();
 
-    if matches!(&cli.command, Commands::Mcp) {
-        let app = Grepple::new_for_mcp(GreppleConfig::default())?;
-        mcp::serve_stdio(&app).context("running MCP server")?;
-        return Ok(());
+    match &cli.command {
+        Commands::Mcp => {
+            let app = Grepple::new_for_mcp(GreppleConfig::default())?;
+            mcp::serve_stdio(&app).context("running MCP server")?;
+            return Ok(());
+        }
+        Commands::Shell { command } => {
+            print_shell_command(command);
+            return Ok(());
+        }
+        _ => {}
     }
 
     let app = Grepple::new(GreppleConfig::default())?;
@@ -272,6 +297,7 @@ fn run() -> Result<()> {
                 anyhow::bail!("installer failed: {}", out.details);
             }
         }
+        Commands::Shell { .. } => unreachable!("handled before app initialization"),
         Commands::Mcp => unreachable!("handled before app initialization"),
     }
 
@@ -378,6 +404,29 @@ fn print_install_summary(out: &InstallerResult, configured_name: &str) {
     println!("Details: {}", out.details);
 }
 
+fn print_shell_command(command: &ShellCommands) {
+    match command {
+        ShellCommands::Init { shell } => print!("{}", shell_init_snippet(*shell)),
+    }
+}
+
+fn shell_init_snippet(shell: ShellFlavor) -> &'static str {
+    match shell {
+        ShellFlavor::Zsh => {
+            r#"alias g="grepple"
+gr() { grepple run -- "$@"; }
+"#
+        }
+        ShellFlavor::Fish => {
+            r#"alias g grepple
+function gr
+    grepple run -- $argv
+end
+"#
+        }
+    }
+}
+
 fn print_sessions_table(sessions: &[grepple_core::model::SessionMetadata]) {
     if sessions.is_empty() {
         println!("No sessions found.");
@@ -434,4 +483,24 @@ fn truncate(value: &str, max: usize) -> String {
     }
     out.push_str("...");
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ShellFlavor, shell_init_snippet};
+
+    #[test]
+    fn shell_init_zsh_contains_alias_and_helper() {
+        let snippet = shell_init_snippet(ShellFlavor::Zsh);
+        assert!(snippet.contains("alias g=\"grepple\""));
+        assert!(snippet.contains("gr() { grepple run -- \"$@\"; }"));
+    }
+
+    #[test]
+    fn shell_init_fish_contains_alias_and_helper() {
+        let snippet = shell_init_snippet(ShellFlavor::Fish);
+        assert!(snippet.contains("alias g grepple"));
+        assert!(snippet.contains("function gr"));
+        assert!(snippet.contains("grepple run -- $argv"));
+    }
 }

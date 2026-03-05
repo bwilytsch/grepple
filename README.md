@@ -72,6 +72,34 @@ Stop a managed session:
 grepple stop <session_id>
 ```
 
+## Shell Helpers
+
+Generate shell helpers for a short alias (`g`) and run wrapper (`gr`):
+
+```bash
+grepple shell init zsh
+grepple shell init fish
+```
+
+Install for current shell session:
+
+```bash
+eval "$(grepple shell init zsh)"
+```
+
+Fish:
+
+```fish
+grepple shell init fish | source
+```
+
+Persist in shell config:
+
+```bash
+grepple shell init zsh >> ~/.zshrc
+grepple shell init fish >> ~/.config/fish/config.fish
+```
+
 ## Install MCP Into Clients
 
 Codex:
