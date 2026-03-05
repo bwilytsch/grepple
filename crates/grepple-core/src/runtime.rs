@@ -2,8 +2,11 @@ use std::{
     ffi::CString,
     fs::OpenOptions,
     io::{Read, Write},
+    mem,
     path::{Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
+    ptr,
+    sync::atomic::{AtomicBool, Ordering},
     sync::{Arc, Mutex},
     thread,
     time::Duration,
@@ -162,9 +165,11 @@ pub fn start_managed_session(
     )?;
 
     if req.foreground {
-        let status = child.wait()?;
+        let _sigint_guard = SigintForwardGuard::install()?;
+        let status = wait_foreground_with_sigint_forwarding(&mut child, pid)?;
         let _ = stdout_pump.join();
         let _ = stderr_pump.join();
+        restore_terminal_state();
         let meta = mark_session_exited(store, &session_id, status)?;
         return Ok(meta);
     }
@@ -552,7 +557,7 @@ fn mark_session_exited(
     status: ExitStatus,
 ) -> Result<SessionMetadata> {
     let mut meta = store.read_meta(session_id)?;
-    meta.exit_code = status.code();
+    meta.exit_code = exit_code_from_status(status);
     if matches!(
         meta.status,
         SessionStatus::Running | SessionStatus::Starting
@@ -575,10 +580,87 @@ fn mark_session_exited(
     Ok(meta)
 }
 
+fn wait_foreground_with_sigint_forwarding(
+    child: &mut std::process::Child,
+    pid: i32,
+) -> Result<ExitStatus> {
+    loop {
+        if SIGINT_RECEIVED.swap(false, Ordering::SeqCst) {
+            let _ = signal_process_group(pid, libc::SIGINT);
+        }
+
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn restore_terminal_state() {
+    // Best-effort terminal reset for interrupted foreground commands.
+    let mut out = std::io::stderr();
+    let _ = out.write_all(b"\x1b[0m\x1b[?25h");
+    let _ = out.flush();
+}
+
+fn exit_code_from_status(status: ExitStatus) -> Option<i32> {
+    status.code().or_else(|| {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            status.signal().map(|signal| 128 + signal)
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    })
+}
+
 #[derive(Clone, Copy)]
 enum MirrorTarget {
     Stdout,
     Stderr,
+}
+
+static SIGINT_RECEIVED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn sigint_flag_handler(_: i32) {
+    SIGINT_RECEIVED.store(true, Ordering::SeqCst);
+}
+
+struct SigintForwardGuard {
+    previous: libc::sigaction,
+}
+
+impl SigintForwardGuard {
+    fn install() -> Result<Self> {
+        SIGINT_RECEIVED.store(false, Ordering::SeqCst);
+
+        let mut previous = mem::MaybeUninit::<libc::sigaction>::uninit();
+        let mut action = unsafe { mem::zeroed::<libc::sigaction>() };
+
+        action.sa_sigaction = sigint_flag_handler as usize;
+        action.sa_flags = 0;
+        unsafe {
+            libc::sigemptyset(&mut action.sa_mask);
+            if libc::sigaction(libc::SIGINT, &action, previous.as_mut_ptr()) != 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            Ok(Self {
+                previous: previous.assume_init(),
+            })
+        }
+    }
+}
+
+impl Drop for SigintForwardGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = libc::sigaction(libc::SIGINT, &self.previous, ptr::null_mut());
+        }
+    }
 }
 
 fn apply_color_env_defaults(cmd: &mut Command, user_env: &[(String, String)]) {
