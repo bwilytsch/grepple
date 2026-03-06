@@ -347,6 +347,7 @@ mod tests {
             combined_path: combined_path.to_string_lossy().to_string(),
             git_context: None,
             provider_ref: None,
+            labels: Vec::new(),
         }
     }
 

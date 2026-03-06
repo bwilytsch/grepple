@@ -599,12 +599,18 @@ impl Grepple {
             }
         }
 
-        let command_match = session
+        let (label_bonus, label_reasons) = crate::classify::label_score(&session.labels, intent);
+        score += label_bonus;
+        reasons.extend(label_reasons);
+
+        let command_text_bonus = session
             .command
             .as_deref()
-            .map(|command| self.command_score(command, intent, &mut reasons))
+            .map(|cmd| self.command_text_score(cmd))
             .unwrap_or(0);
-        score += command_match;
+        score += command_text_bonus;
+
+        let command_match = label_bonus + command_text_bonus;
 
         let age = (Utc::now() - session.last_activity_at)
             .num_minutes()
@@ -620,80 +626,18 @@ impl Grepple {
             cwd_match,
             running,
             command_match: command_match > 0,
+            label_match: label_bonus > 0,
             reasons,
         }
     }
 
-    fn command_score(&self, command: &str, intent: Option<&str>, reasons: &mut Vec<String>) -> i64 {
+    fn command_text_score(&self, command: &str) -> i64 {
         let lower = command.to_ascii_lowercase();
-        let mut score = 0_i64;
-
-        let command_patterns = [
-            "modal serve",
-            "pnpm dev",
-            "pnpm start",
-            "npm run dev",
-            "npm run start",
-            "yarn dev",
-            "yarn start",
-            "bun dev",
-            "bun start",
-            "uvicorn",
-            "flask run",
-            "manage.py runserver",
-            "vite",
-            "next dev",
-            "next start",
-            "webpack-dev-server",
-            "turbo dev",
-            "nodemon",
-            "docker compose up",
-            "docker-compose up",
-            "rails server",
-            "air ",
-        ];
-
-        if command_patterns
-            .iter()
-            .any(|pattern| lower.contains(pattern))
-        {
-            score += 120;
-            reasons.push("dev/runtime command".to_string());
-        }
-
         if lower.contains("dev") || lower.contains("serve") || lower.contains("server") {
-            score += 30;
+            30
+        } else {
+            0
         }
-
-        let intent = intent.unwrap_or_default().to_ascii_lowercase();
-        if !intent.is_empty() {
-            if intent.contains("frontend")
-                && ["vite", "next", "webpack", "frontend", "ui"]
-                    .iter()
-                    .any(|needle| lower.contains(needle))
-            {
-                score += 50;
-                reasons.push("frontend intent match".to_string());
-            }
-            if intent.contains("backend")
-                && ["uvicorn", "flask", "server", "api", "rails", "modal"]
-                    .iter()
-                    .any(|needle| lower.contains(needle))
-            {
-                score += 50;
-                reasons.push("backend intent match".to_string());
-            }
-            if [
-                "error", "logs", "stack", "trace", "runtime", "server", "watch",
-            ]
-            .iter()
-            .any(|needle| intent.contains(needle))
-            {
-                score += 25;
-            }
-        }
-
-        score
     }
 
     fn default_session_sort_key(

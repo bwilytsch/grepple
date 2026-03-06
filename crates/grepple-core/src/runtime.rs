@@ -17,6 +17,7 @@ use serde_json::json;
 use ulid::Ulid;
 
 use crate::{
+    classify::classify_command,
     error::{GreppleError, Result},
     model::{
         AttachSessionRequest, GitContext, SCHEMA_VERSION, SessionMetadata, SessionProvider,
@@ -136,6 +137,7 @@ pub fn start_managed_session(
     stderr_marker.write_all(marker.as_bytes())?;
     combined_marker.write_all(marker.as_bytes())?;
 
+    let labels = classify_command(&req.command);
     let mut meta = SessionMetadata {
         schema_version: SCHEMA_VERSION,
         session_id: session_id.clone(),
@@ -157,6 +159,7 @@ pub fn start_managed_session(
         combined_path: combined_path.display().to_string(),
         git_context: capture_git_context(Path::new(&cwd)),
         provider_ref: None,
+        labels,
     };
 
     meta.summary_last_line = store.update_summary_from_combined(&session_id)?;
@@ -280,6 +283,7 @@ pub fn attach_tmux_session(
         combined_path: combined_path.display().to_string(),
         git_context: capture_git_context(Path::new(&cwd)),
         provider_ref: Some(selected.pane_id),
+        labels: classify_command(&selected.command),
     };
 
     store.write_meta(&meta)?;

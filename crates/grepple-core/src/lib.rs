@@ -1,4 +1,5 @@
 pub mod app;
+pub mod classify;
 pub mod error;
 pub mod installer;
 pub mod log_ops;

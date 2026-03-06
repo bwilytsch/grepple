@@ -53,6 +53,8 @@ pub struct SessionMetadata {
     pub combined_path: String,
     pub git_context: Option<GitContext>,
     pub provider_ref: Option<String>,
+    #[serde(default)]
+    pub labels: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,6 +96,7 @@ pub struct RankedSession {
     pub cwd_match: bool,
     pub running: bool,
     pub command_match: bool,
+    pub label_match: bool,
     pub reasons: Vec<String>,
 }
 
