@@ -6,7 +6,19 @@ use std::{
 };
 
 use anyhow::{Result, anyhow};
+use crossterm::{
+    cursor, execute,
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+};
 use grepple_core::{Grepple, GreppleConfig, model::InstallerResult};
+use ratatui::{
+    Frame, Terminal,
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout},
+    style::{Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Paragraph},
+};
 
 #[derive(Debug, Clone)]
 pub struct InstallUiRequest {
@@ -38,50 +50,145 @@ pub fn run_install_tui(req: InstallUiRequest) -> Result<InstallerResult> {
         let _ = tx.send(result.map_err(|e| e.to_string()));
     });
 
-    let mut stderr = io::stderr();
-    let spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-    let started = Instant::now();
-    let mut idx = 0usize;
+    let install_outcome = {
+        let mut terminal = InstallTerminal::new()?;
+        let spinner = ["-", "\\", "|", "/"];
+        let started = Instant::now();
+        let mut idx = 0usize;
 
-    loop {
-        match rx.try_recv() {
-            Ok(Ok(result)) => {
-                clear_progress_line(&mut stderr)?;
-                print_install_result(&mut stderr, &result, &req.name)?;
-                return Ok(result);
+        loop {
+            terminal.draw(&req, spinner[idx % spinner.len()], started.elapsed())?;
+            idx = idx.wrapping_add(1);
+
+            match rx.recv_timeout(Duration::from_millis(90)) {
+                Ok(result) => break result,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    break Err("installer worker disconnected".to_string());
+                }
             }
-            Ok(Err(err)) => {
-                clear_progress_line(&mut stderr)?;
-                writeln!(stderr, "grepple :: install")?;
-                writeln!(stderr, "  client : {}", req.client)?;
-                writeln!(stderr, "  status : failed")?;
-                writeln!(stderr, "  error  : {}", err)?;
-                return Err(anyhow!(err));
-            }
-            Err(mpsc::TryRecvError::Empty) => {
-                let frame = spinner[idx % spinner.len()];
-                idx = idx.wrapping_add(1);
-                let elapsed = started.elapsed().as_secs_f32();
-                write!(
-                    stderr,
-                    "\r{frame} grepple :: installing MCP for {} ({elapsed:.1}s)",
-                    req.client
-                )?;
-                stderr.flush()?;
-                thread::sleep(Duration::from_millis(90));
-            }
-            Err(mpsc::TryRecvError::Disconnected) => {
-                clear_progress_line(&mut stderr)?;
-                return Err(anyhow!("installer worker disconnected"));
-            }
+        }
+    };
+
+    let mut stderr = io::stderr();
+    match install_outcome {
+        Ok(result) => {
+            print_install_result(&mut stderr, &result, &req.name)?;
+            Ok(result)
+        }
+        Err(err) => {
+            writeln!(stderr, "grepple :: install")?;
+            writeln!(stderr, "  client : {}", req.client)?;
+            writeln!(stderr, "  status : failed")?;
+            writeln!(stderr, "  error  : {}", err)?;
+            Err(anyhow!(err))
         }
     }
 }
 
-fn clear_progress_line(stderr: &mut io::Stderr) -> Result<()> {
-    write!(stderr, "\r{}\r", " ".repeat(80))?;
-    stderr.flush()?;
-    Ok(())
+struct InstallTerminal {
+    terminal: Terminal<CrosstermBackend<io::Stderr>>,
+}
+
+impl InstallTerminal {
+    fn new() -> Result<Self> {
+        enable_raw_mode()?;
+
+        let mut stderr = io::stderr();
+        if let Err(err) = execute!(stderr, EnterAlternateScreen, cursor::Hide) {
+            let _ = disable_raw_mode();
+            return Err(err.into());
+        }
+
+        let backend = CrosstermBackend::new(stderr);
+        let mut terminal = match Terminal::new(backend) {
+            Ok(terminal) => terminal,
+            Err(err) => {
+                let mut stderr = io::stderr();
+                let _ = execute!(stderr, LeaveAlternateScreen, cursor::Show);
+                let _ = disable_raw_mode();
+                return Err(err.into());
+            }
+        };
+
+        if let Err(err) = terminal.clear() {
+            let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen, cursor::Show);
+            let _ = disable_raw_mode();
+            return Err(err.into());
+        }
+
+        Ok(Self { terminal })
+    }
+
+    fn draw(&mut self, req: &InstallUiRequest, spinner: &str, elapsed: Duration) -> Result<()> {
+        self.terminal
+            .draw(|frame| render_install(frame, req, spinner, elapsed))?;
+        Ok(())
+    }
+}
+
+impl Drop for InstallTerminal {
+    fn drop(&mut self) {
+        let _ = self.terminal.clear();
+        let _ = self.terminal.show_cursor();
+        let _ = execute!(
+            self.terminal.backend_mut(),
+            LeaveAlternateScreen,
+            cursor::Show
+        );
+        let _ = disable_raw_mode();
+    }
+}
+
+fn render_install(frame: &mut Frame<'_>, req: &InstallUiRequest, spinner: &str, elapsed: Duration) {
+    let area = frame.area();
+    let block = Block::bordered().title(" grepple install ");
+    let inner = block.inner(area);
+
+    frame.render_widget(block, area);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
+        ])
+        .split(inner);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(spinner, Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" Installing Grepple MCP client"),
+        ])),
+        rows[0],
+    );
+    frame.render_widget(detail_line("status", "in progress"), rows[1]);
+    frame.render_widget(detail_line("client", &req.client), rows[2]);
+    frame.render_widget(detail_line("name", &req.name), rows[3]);
+    frame.render_widget(
+        detail_line("elapsed", &format!("{:.1}s", elapsed.as_secs_f32())),
+        rows[4],
+    );
+    frame.render_widget(
+        Paragraph::new(
+            "Writing config and installing MCP entry. This screen closes automatically.",
+        ),
+        rows[5],
+    );
+}
+
+fn detail_line<'a>(label: &'a str, value: &'a str) -> Paragraph<'a> {
+    Paragraph::new(Line::from(vec![
+        Span::styled(
+            format!("{label:>7} : "),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(value),
+    ]))
 }
 
 fn print_install_result(
