@@ -24,6 +24,8 @@ enum Framing {
 const MCP_LOG_DEFAULT_MAX_CHARS: usize = 12_000;
 const MCP_LOG_MIN_MAX_CHARS: usize = 128;
 const MCP_LOG_HARD_MAX_CHARS: usize = 200_000;
+const INITIALIZE_INSTRUCTIONS: &str = "Use Grepple first for live local logs/processes: local server logs, dev server output, runtime errors, stack traces, and active backend/frontend sessions. When the user asks about logs, errors, a server, a dev server, or a stack trace, prefer Grepple session discovery before code search. Start with pick_best_session or current_repo_sessions using caller_cwd, prefer matching running sessions in the current repo/worktree, then use session_preset, log_error_counts, log_search, and log_read. Answer the user's question directly first (for yes/no questions, start with Yes or No). For simple factual questions, respond in one sentence and keep only the minimum evidence needed. Do not mention session IDs, tool names, status checks, line counts, or aggregate log stats unless the user explicitly asks for them.";
+const DEBUG_PROMPT_TEXT: &str = "For logs/errors/server/dev server/stack trace prompts, call pick_best_session or current_repo_sessions first with caller_cwd. Prefer matching running sessions in the current repo/worktree; only fall back to stopped sessions when needed. Use session_preset for common debugging flows, log_error_counts for recent error counts, then log_search/log_read incrementally by offsets. In the final response, answer the user's question in the first sentence (Yes/No when applicable). For simple factual questions, use one sentence and only the minimum evidence needed. Do not mention session IDs, tool names, status checks, line counts, or aggregate log stats unless the user explicitly asks for them.";
 
 pub fn serve_stdio(app: &Grepple) -> Result<()> {
     let stdin = io::stdin();
@@ -97,7 +99,7 @@ fn handle_request(app: &Grepple, msg: &Value) -> Result<Value> {
                 "title": "Grepple: live local logs/processes",
                 "version": env!("CARGO_PKG_VERSION"),
             },
-            "instructions": "Use Grepple first for live local logs/processes: local server logs, dev server output, runtime errors, stack traces, and active backend/frontend sessions. When the user asks about logs, errors, a server, a dev server, or a stack trace, prefer Grepple session discovery before code search. Start with pick_best_session or current_repo_sessions using caller_cwd, prefer matching running sessions in the current repo/worktree, then use session_preset, log_error_counts, log_search, and log_read. Answer the user's question directly first (for yes/no questions, start with Yes or No) and keep only the minimum evidence needed.",
+            "instructions": INITIALIZE_INSTRUCTIONS,
         })),
         "tools/list" => Ok(json!({"tools": tool_list()})),
         "prompts/list" => Ok(json!({"prompts": [
@@ -113,7 +115,7 @@ fn handle_request(app: &Grepple, msg: &Value) -> Result<Value> {
                     "role": "assistant",
                     "content": {
                         "type": "text",
-                        "text": "For logs/errors/server/dev server/stack trace prompts, call pick_best_session or current_repo_sessions first with caller_cwd. Prefer matching running sessions in the current repo/worktree; only fall back to stopped sessions when needed. Use session_preset for common debugging flows, log_error_counts for recent error counts, then log_search/log_read incrementally by offsets. In the final response, answer the user's question in the first sentence (Yes/No when applicable), then add brief evidence."
+                        "text": DEBUG_PROMPT_TEXT
                     }
                 }
             ]
@@ -652,7 +654,7 @@ fn tool_list() -> Vec<Value> {
         tool(
             "log_stats",
             "Grepple Log Stats",
-            "Grepple: compute line and error-like counts for a local runtime log stream",
+            "Grepple: optional aggregate counts when explicitly requested",
             tool_hints(true, false, true),
             json!({
                 "type":"object",
@@ -1022,8 +1024,28 @@ fn strip_terminal_control(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{TruncateKeep, read_message, shape_log_text, strip_terminal_control, tool_list};
     use std::io::BufReader;
+    use std::path::PathBuf;
+
+    use serde_json::json;
+
+    use super::{
+        DEBUG_PROMPT_TEXT, INITIALIZE_INSTRUCTIONS, TruncateKeep, handle_request, read_message,
+        shape_log_text, strip_terminal_control, tool_list,
+    };
+    use crate::app::{Grepple, GreppleConfig};
+
+    fn temp_state_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("grepple-mcp-test-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    fn test_app() -> Grepple {
+        let mut config = GreppleConfig::default();
+        config.state_dir = temp_state_dir();
+        Grepple::new_for_mcp(config).expect("create app")
+    }
 
     #[test]
     fn read_message_accepts_content_length_framing() {
@@ -1110,5 +1132,55 @@ mod tests {
             .find(|t| t["name"] == "session_list")
             .expect("session_list tool");
         assert!(session_list["inputSchema"]["properties"]["caller_cwd"].is_object());
+    }
+
+    #[test]
+    fn initialize_instructions_push_direct_terse_answers() {
+        let app = test_app();
+        let result = handle_request(
+            &app,
+            &json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
+        )
+        .expect("initialize should succeed");
+
+        assert_eq!(result["instructions"], INITIALIZE_INSTRUCTIONS);
+        let instructions = result["instructions"].as_str().expect("instructions text");
+        assert!(instructions.contains("For simple factual questions, respond in one sentence"));
+        assert!(instructions.contains(
+            "Do not mention session IDs, tool names, status checks, line counts, or aggregate log stats unless the user explicitly asks for them."
+        ));
+    }
+
+    #[test]
+    fn debug_prompt_pushes_direct_terse_answers() {
+        let app = test_app();
+        let result = handle_request(
+            &app,
+            &json!({"jsonrpc": "2.0", "id": 1, "method": "prompts/get", "params": {}}),
+        )
+        .expect("prompt lookup should succeed");
+
+        let prompt = result["messages"][0]["content"]["text"]
+            .as_str()
+            .expect("prompt text");
+        assert_eq!(prompt, DEBUG_PROMPT_TEXT);
+        assert!(prompt.contains("For simple factual questions, use one sentence"));
+        assert!(prompt.contains(
+            "Do not mention session IDs, tool names, status checks, line counts, or aggregate log stats unless the user explicitly asks for them."
+        ));
+    }
+
+    #[test]
+    fn log_stats_tool_description_is_optional_only() {
+        let tools = tool_list();
+        let log_stats = tools
+            .iter()
+            .find(|t| t["name"] == "log_stats")
+            .expect("log_stats tool");
+
+        assert_eq!(
+            log_stats["description"],
+            "Grepple: optional aggregate counts when explicitly requested"
+        );
     }
 }
