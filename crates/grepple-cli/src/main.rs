@@ -13,6 +13,12 @@ use grepple_core::{
     },
     runtime::list_tmux_panes,
 };
+use ratatui::{
+    buffer::Buffer,
+    layout::{Constraint, Rect},
+    style::{Modifier, Style},
+    widgets::{Block, Row, Table, Widget},
+};
 
 mod tui;
 
@@ -477,23 +483,25 @@ fn print_sessions_table(sessions: &[grepple_core::model::SessionMetadata]) {
         return;
     }
 
-    const ID_W: usize = 26;
-    const STATUS_W: usize = 10;
-    const PROVIDER_W: usize = 12;
-    const NAME_W: usize = 28;
-    const BRANCH_W: usize = 18;
-    const LAST_W: usize = 54;
+    print!("{}", render_sessions_table(sessions));
+}
 
-    let total_w = ID_W + STATUS_W + PROVIDER_W + NAME_W + BRANCH_W + LAST_W + 5;
-    println!("SESSIONS");
-    println!("{}", "-".repeat(total_w));
-    println!(
-        "{:<ID_W$} {:<STATUS_W$} {:<PROVIDER_W$} {:<NAME_W$} {:<BRANCH_W$} {:<LAST_W$}",
-        "SESSION ID", "STATUS", "PROVIDER", "NAME", "BRANCH", "LAST LINE"
-    );
-    println!("{}", "-".repeat(total_w));
+fn render_sessions_table(sessions: &[grepple_core::model::SessionMetadata]) -> String {
+    const ID_W: u16 = 26;
+    const STATUS_W: u16 = 10;
+    const PROVIDER_W: u16 = 12;
+    const NAME_W: u16 = 28;
+    const BRANCH_W: u16 = 18;
+    const LAST_W: u16 = 54;
+    const COLUMN_SPACING: u16 = 1;
+    const COLUMNS: u16 = 6;
+    const BORDERS_W: u16 = 2;
+    const HEADER_AND_BORDERS_H: u16 = 3;
 
-    for session in sessions {
+    let max_rows = usize::from(u16::MAX.saturating_sub(HEADER_AND_BORDERS_H));
+    let visible_rows = sessions.len().min(max_rows);
+
+    let rows = sessions.iter().take(visible_rows).map(|session| {
         let status = format!("{:?}", session.status).to_lowercase();
         let provider = format!("{:?}", session.provider).to_lowercase();
         let branch = session
@@ -503,16 +511,78 @@ fn print_sessions_table(sessions: &[grepple_core::model::SessionMetadata]) {
             .unwrap_or("-");
         let last = session.summary_last_line.as_deref().unwrap_or("-");
 
-        println!(
-            "{:<ID_W$} {:<STATUS_W$} {:<PROVIDER_W$} {:<NAME_W$} {:<BRANCH_W$} {:<LAST_W$}",
-            truncate(&session.session_id, ID_W),
-            truncate(&status, STATUS_W),
-            truncate(&provider, PROVIDER_W),
-            truncate(&session.display_name, NAME_W),
-            truncate(branch, BRANCH_W),
-            truncate(last, LAST_W),
-        );
+        Row::new(vec![
+            truncate(&session.session_id, usize::from(ID_W)),
+            truncate(&status, usize::from(STATUS_W)),
+            truncate(&provider, usize::from(PROVIDER_W)),
+            truncate(&session.display_name, usize::from(NAME_W)),
+            truncate(branch, usize::from(BRANCH_W)),
+            truncate(last, usize::from(LAST_W)),
+        ])
+    });
+
+    let min_width = ID_W
+        .saturating_add(STATUS_W)
+        .saturating_add(PROVIDER_W)
+        .saturating_add(NAME_W)
+        .saturating_add(BRANCH_W)
+        .saturating_add(LAST_W)
+        .saturating_add(COLUMN_SPACING.saturating_mul(COLUMNS.saturating_sub(1)))
+        .saturating_add(BORDERS_W);
+
+    let width = terminal_table_width().max(min_width);
+    let height = u16::try_from(visible_rows)
+        .unwrap_or(u16::MAX.saturating_sub(HEADER_AND_BORDERS_H))
+        .saturating_add(HEADER_AND_BORDERS_H);
+
+    let area = Rect::new(0, 0, width, height);
+    let mut buffer = Buffer::empty(area);
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(ID_W),
+            Constraint::Length(STATUS_W),
+            Constraint::Length(PROVIDER_W),
+            Constraint::Length(NAME_W),
+            Constraint::Length(BRANCH_W),
+            Constraint::Length(LAST_W),
+        ],
+    )
+    .column_spacing(COLUMN_SPACING)
+    .header(
+        Row::new([
+            "SESSION ID",
+            "STATUS",
+            "PROVIDER",
+            "NAME",
+            "BRANCH",
+            "LAST LINE",
+        ])
+        .style(Style::default().add_modifier(Modifier::BOLD)),
+    )
+    .block(Block::bordered().title("SESSIONS"));
+
+    table.render(area, &mut buffer);
+    buffer_to_string(&buffer)
+}
+
+fn terminal_table_width() -> u16 {
+    crossterm::terminal::size().map_or(153, |(width, _)| width)
+}
+
+fn buffer_to_string(buffer: &Buffer) -> String {
+    let area = *buffer.area();
+    let mut out = String::new();
+    for y in area.y..area.y.saturating_add(area.height) {
+        let mut line = String::new();
+        for x in area.x..area.x.saturating_add(area.width) {
+            line.push_str(buffer[(x, y)].symbol());
+        }
+        out.push_str(line.trim_end_matches(' '));
+        out.push('\n');
     }
+    out
 }
 
 fn truncate(value: &str, max: usize) -> String {
