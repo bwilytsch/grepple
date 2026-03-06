@@ -364,18 +364,21 @@ fn tool_list() -> Vec<Value> {
             "session_list",
             "List sessions",
             "List grepple sessions with status and git context",
+            tool_hints(true, false, true),
             json!({"type": "object", "properties": {}}),
         ),
         tool(
             "session_status",
             "Session status",
             "Get one session status",
+            tool_hints(true, false, true),
             json!({"type": "object", "required": ["session_id"], "properties": {"session_id": {"type": "string"}}}),
         ),
         tool(
             "session_start_command",
             "Start command",
             "Start a managed command session",
+            tool_hints(false, true, false),
             json!({
                 "type": "object",
                 "required": ["command"],
@@ -391,18 +394,21 @@ fn tool_list() -> Vec<Value> {
             "session_attach",
             "Attach tmux",
             "Attach to tmux pane and create session snapshot",
+            tool_hints(false, false, false),
             json!({"type": "object", "properties": {"target": {"type": "string"}, "name": {"type": "string"}}}),
         ),
         tool(
             "session_stop",
             "Stop session",
             "Stop a managed session process group",
+            tool_hints(false, true, true),
             json!({"type": "object", "required": ["session_id"], "properties": {"session_id": {"type": "string"}, "grace_ms": {"type": "number"}}}),
         ),
         tool(
             "log_read",
             "Read logs",
             "Read logs incrementally by byte offset",
+            tool_hints(true, false, true),
             json!({
                 "type": "object",
                 "required": ["session_id"],
@@ -420,6 +426,7 @@ fn tool_list() -> Vec<Value> {
             "log_search",
             "Search logs",
             "Search logs using plain text or regex",
+            tool_hints(true, false, true),
             json!({
                 "type": "object",
                 "required": ["session_id", "query"],
@@ -441,6 +448,7 @@ fn tool_list() -> Vec<Value> {
             "log_tail",
             "Tail logs",
             "Read the last N lines from a stream",
+            tool_hints(true, false, true),
             json!({
                 "type":"object",
                 "required": ["session_id"],
@@ -457,12 +465,14 @@ fn tool_list() -> Vec<Value> {
             "log_stats",
             "Log stats",
             "Compute line and error-like counts for a stream",
+            tool_hints(true, false, true),
             json!({"type":"object", "required": ["session_id"], "properties": {"session_id": {"type":"string"}, "stream": {"type":"string"}}}),
         ),
         tool(
             "install_client",
             "Install client",
             "Install grepple into codex, claude, or opencode",
+            tool_hints(false, true, false),
             json!({
                 "type": "object",
                 "required": ["client"],
@@ -479,12 +489,27 @@ fn tool_list() -> Vec<Value> {
     ]
 }
 
-fn tool(name: &str, title: &str, description: &str, input_schema: Value) -> Value {
+fn tool(
+    name: &str,
+    title: &str,
+    description: &str,
+    annotations: Value,
+    input_schema: Value,
+) -> Value {
     json!({
         "name": name,
         "title": title,
         "description": description,
+        "annotations": annotations,
         "inputSchema": input_schema,
+    })
+}
+
+fn tool_hints(read_only: bool, destructive: bool, idempotent: bool) -> Value {
+    json!({
+        "readOnlyHint": read_only,
+        "destructiveHint": destructive,
+        "idempotentHint": idempotent
     })
 }
 
@@ -762,7 +787,7 @@ fn strip_terminal_control(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{TruncateKeep, read_message, shape_log_text, strip_terminal_control};
+    use super::{TruncateKeep, read_message, shape_log_text, strip_terminal_control, tool_list};
     use std::io::BufReader;
 
     #[test]
@@ -813,5 +838,25 @@ mod tests {
         let shaped = shape_log_text("1234567890", false, 4, TruncateKeep::End);
         assert_eq!(shaped.text, "7890");
         assert!(shaped.truncated);
+    }
+
+    #[test]
+    fn tool_list_contains_safety_annotations() {
+        let tools = tool_list();
+
+        let log_search = tools
+            .iter()
+            .find(|t| t["name"] == "log_search")
+            .expect("log_search tool");
+        assert_eq!(log_search["annotations"]["readOnlyHint"], true);
+        assert_eq!(log_search["annotations"]["destructiveHint"], false);
+        assert_eq!(log_search["annotations"]["idempotentHint"], true);
+
+        let session_start = tools
+            .iter()
+            .find(|t| t["name"] == "session_start_command")
+            .expect("session_start_command tool");
+        assert_eq!(session_start["annotations"]["readOnlyHint"], false);
+        assert_eq!(session_start["annotations"]["destructiveHint"], true);
     }
 }

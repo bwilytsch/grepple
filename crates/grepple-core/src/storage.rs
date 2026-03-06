@@ -283,12 +283,21 @@ impl SessionStore {
     pub fn opencode_config_path(scope: &str, cwd: &Path) -> PathBuf {
         match scope {
             "project" => cwd.join("opencode.json"),
-            _ => dirs::config_dir()
-                .unwrap_or_else(|| PathBuf::from("~/.config"))
+            _ => opencode_user_config_root()
                 .join("opencode")
                 .join("opencode.json"),
         }
     }
+}
+
+fn opencode_user_config_root() -> PathBuf {
+    if let Some(path) = std::env::var_os("XDG_CONFIG_HOME").filter(|p| !p.is_empty()) {
+        return PathBuf::from(path);
+    }
+
+    dirs::home_dir()
+        .map(|home| home.join(".config"))
+        .unwrap_or_else(|| PathBuf::from("~/.config"))
 }
 
 #[cfg(test)]
