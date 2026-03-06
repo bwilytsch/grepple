@@ -9,7 +9,7 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
     sync::{Arc, Mutex},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use chrono::Utc;
@@ -97,6 +97,10 @@ pub fn start_managed_session(
         stdout_reader,
         stdout_path.clone(),
         Arc::clone(&combined_writer),
+        Some(ActivityTracker {
+            store: store.clone(),
+            session_id: session_id.clone(),
+        }),
         if req.foreground {
             Some(MirrorTarget::Stdout)
         } else {
@@ -107,6 +111,10 @@ pub fn start_managed_session(
         stderr_reader,
         stderr_path.clone(),
         Arc::clone(&combined_writer),
+        Some(ActivityTracker {
+            store: store.clone(),
+            session_id: session_id.clone(),
+        }),
         if req.foreground {
             Some(MirrorTarget::Stderr)
         } else {
@@ -238,10 +246,12 @@ pub fn attach_tmux_session(
     std::fs::write(&combined_path, captured.as_bytes())?;
     std::fs::write(&stdout_path, captured.as_bytes())?;
 
-    let cwd = std::env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .display()
-        .to_string();
+    let cwd = selected.cwd.clone().unwrap_or_else(|| {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .display()
+            .to_string()
+    });
     let now = Utc::now();
     let auto_name = build_default_name(req.name, &cwd, Some(&selected.label), None);
 
@@ -371,7 +381,7 @@ pub fn list_tmux_panes() -> Result<Vec<TmuxPane>> {
         .arg("list-panes")
         .arg("-a")
         .arg("-F")
-        .arg("#{session_name}:#{window_index}.#{pane_index}|#{pane_id}|#{pane_current_command}")
+        .arg("#{session_name}:#{window_index}.#{pane_index}\t#{pane_id}\t#{pane_current_command}\t#{pane_current_path}")
         .output()?;
     if !output.status.success() {
         return Ok(Vec::new());
@@ -380,7 +390,7 @@ pub fn list_tmux_panes() -> Result<Vec<TmuxPane>> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut panes = Vec::new();
     for line in stdout.lines() {
-        let parts: Vec<&str> = line.split('|').collect();
+        let parts: Vec<&str> = line.splitn(4, '\t').collect();
         if parts.len() < 3 {
             continue;
         }
@@ -388,6 +398,7 @@ pub fn list_tmux_panes() -> Result<Vec<TmuxPane>> {
             label: parts[0].to_string(),
             pane_id: parts[1].to_string(),
             command: parts[2].to_string(),
+            cwd: parts.get(3).map(|v| (*v).to_string()),
         });
     }
     Ok(panes)
@@ -398,6 +409,7 @@ pub struct TmuxPane {
     pub label: String,
     pub pane_id: String,
     pub command: String,
+    pub cwd: Option<String>,
 }
 
 pub fn build_default_name(
@@ -436,14 +448,17 @@ fn with_suffix(base: String) -> String {
 }
 
 pub fn capture_git_context(cwd: &Path) -> Option<GitContext> {
-    let repo_root = git_output(cwd, &["rev-parse", "--show-toplevel"])?;
+    let worktree_root = normalize_path(git_output(cwd, &["rev-parse", "--show-toplevel"])?);
+    let repo_root = git_common_dir_to_repo_root(cwd)
+        .map(normalize_path)
+        .unwrap_or_else(|| worktree_root.clone());
     let branch = git_output(cwd, &["branch", "--show-current"])
         .or_else(|| git_output(cwd, &["rev-parse", "--short", "HEAD"]))?;
     let head_sha = git_output(cwd, &["rev-parse", "HEAD"])?;
 
     Some(GitContext {
-        repo_root: repo_root.clone(),
-        worktree_root: repo_root,
+        repo_root,
+        worktree_root,
         branch,
         head_sha,
         captured_at: Utc::now(),
@@ -462,6 +477,41 @@ fn git_output(cwd: &Path, args: &[&str]) -> Option<String> {
     }
     let out = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if out.is_empty() { None } else { Some(out) }
+}
+
+fn git_common_dir_to_repo_root(cwd: &Path) -> Option<String> {
+    let common_dir = git_output(cwd, &["rev-parse", "--git-common-dir"])?;
+    let common_path = PathBuf::from(&common_dir);
+    let common_path = if common_path.is_absolute() {
+        common_path
+    } else {
+        cwd.join(common_path)
+    };
+    let canonical = std::fs::canonicalize(common_path).ok()?;
+    if canonical.file_name().and_then(|v| v.to_str()) == Some(".git") {
+        return canonical.parent().map(|p| p.display().to_string());
+    }
+    Some(canonical.display().to_string())
+}
+
+fn normalize_path(path: String) -> String {
+    std::fs::canonicalize(&path)
+        .map(|p| p.display().to_string())
+        .unwrap_or(path)
+}
+
+fn touch_session_activity(store: &SessionStore, session_id: &str) -> Result<()> {
+    let mut meta = store.read_meta(session_id)?;
+    if matches!(
+        meta.status,
+        SessionStatus::Running | SessionStatus::Starting
+    ) {
+        let now = Utc::now();
+        meta.updated_at = now;
+        meta.last_activity_at = now;
+        store.write_meta(&meta)?;
+    }
+    Ok(())
 }
 
 fn signal_process_group(pid: i32, signal: i32) -> Result<()> {
@@ -500,10 +550,17 @@ pub fn process_group_name(pid: i32) -> Option<String> {
     Some(format!("pgid:{pid}"))
 }
 
+#[derive(Clone)]
+struct ActivityTracker {
+    store: SessionStore,
+    session_id: String,
+}
+
 fn spawn_stream_pump<R: Read + Send + 'static>(
     mut reader: R,
     stream_path: PathBuf,
     combined: Arc<Mutex<std::fs::File>>,
+    activity: Option<ActivityTracker>,
     mirror: Option<MirrorTarget>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
@@ -513,6 +570,7 @@ fn spawn_stream_pump<R: Read + Send + 'static>(
         };
 
         let mut buffer = [0_u8; 8192];
+        let mut last_touch = Instant::now() - Duration::from_secs(2);
         loop {
             let read_n = match reader.read(&mut buffer) {
                 Ok(0) => break,
@@ -546,6 +604,13 @@ fn spawn_stream_pump<R: Read + Send + 'static>(
                 }
             } else {
                 break;
+            }
+
+            if let Some(activity) = &activity {
+                if last_touch.elapsed() >= Duration::from_secs(1) {
+                    let _ = touch_session_activity(&activity.store, &activity.session_id);
+                    last_touch = Instant::now();
+                }
             }
         }
     })

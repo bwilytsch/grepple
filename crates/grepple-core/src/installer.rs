@@ -211,9 +211,15 @@ fn install_claude(req: InstallRequest) -> Result<InstallerResult> {
 
 fn install_opencode(req: InstallRequest) -> Result<InstallerResult> {
     let config_path = SessionStore::opencode_config_path(&req.scope, &req.cwd);
+    let instructions_name = "grepple-opencode-instructions.md";
+    let instructions_path = config_path
+        .parent()
+        .unwrap_or_else(|| req.cwd.as_path())
+        .join(instructions_name);
     let plan = InstallerPlan {
         client: "opencode".to_string(),
-        description: "Patch OpenCode config with grepple MCP entry".to_string(),
+        description: "Patch OpenCode config with grepple MCP entry and log-debugging guidance"
+            .to_string(),
         command_preview: None,
         config_path: Some(config_path.display().to_string()),
     };
@@ -270,10 +276,28 @@ fn install_opencode(req: InstallRequest) -> Result<InstallerResult> {
     }
     mcp_obj.insert(req.name.clone(), entry);
 
+    let instructions = root
+        .as_object_mut()
+        .expect("object")
+        .entry("instructions")
+        .or_insert_with(|| json!([]));
+    if !instructions.is_array() {
+        *instructions = json!([]);
+    }
+    let instructions_array = instructions.as_array_mut().expect("array");
+    if !instructions_array
+        .iter()
+        .any(|item| item.as_str() == Some(instructions_name))
+    {
+        instructions_array.push(json!(instructions_name));
+    }
+
     let backup = config_path.with_extension(format!("bak-{}", Utc::now().format("%Y%m%d%H%M%S")));
     if config_path.exists() {
         fs::copy(&config_path, &backup)?;
     }
+
+    fs::write(&instructions_path, opencode_instructions_content())?;
 
     let tmp = config_path.with_extension("tmp");
     fs::write(&tmp, serde_json::to_string_pretty(&root)?)?;
@@ -291,4 +315,18 @@ fn install_opencode(req: InstallRequest) -> Result<InstallerResult> {
         success: true,
         details: format!("updated {}", config_path.display()),
     })
+}
+
+fn opencode_instructions_content() -> &'static str {
+    r#"# Grepple local log debugging
+
+When a prompt mentions logs, errors, server, dev server, stack trace, backend, frontend, or runtime output:
+
+- check Grepple before broad code search
+- start with `pick_best_session` or `current_repo_sessions` using the current repo cwd
+- use `session_preset` for `recent_errors`, `startup_failures`, `watch_errors`, or `session_summary`
+- use `log_error_counts`, `log_search`, `log_tail`, and `log_read` for deeper inspection
+
+Prefer running sessions in the current repo/worktree over older stopped sessions unless the user explicitly wants historical logs.
+"#
 }

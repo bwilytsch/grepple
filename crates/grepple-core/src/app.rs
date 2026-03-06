@@ -11,9 +11,10 @@ use crate::{
     installer::{Client, InstallRequest, install},
     log_ops,
     model::{
-        AttachSessionRequest, InstallerResult, LogReadRequest, LogReadResult, LogSearchRequest,
-        LogSearchResult, LogStats, SessionMetadata, SessionStatus, StartSessionRequest,
-        StopSessionRequest, Warning,
+        AttachSessionRequest, InstallerResult, LogErrorCountRequest, LogErrorCounts,
+        LogReadRequest, LogReadResult, LogSearchRequest, LogSearchResult, LogStats, RankedSession,
+        SessionMetadata, SessionPresetKind, SessionPresetResult, SessionResolveResult,
+        SessionStatus, StartSessionRequest, StopSessionRequest, Warning,
     },
     runtime::{
         RuntimeOptions, attach_tmux_session, build_default_name, list_tmux_panes, refresh_status,
@@ -136,7 +137,76 @@ impl Grepple {
                 }
             }
         }
+        sessions.sort_by(|a, b| {
+            self.default_session_sort_key(b)
+                .cmp(&self.default_session_sort_key(a))
+        });
         Ok(sessions)
+    }
+
+    pub fn list_ranked_sessions(
+        &self,
+        caller_cwd: Option<&Path>,
+        intent: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Vec<RankedSession>> {
+        let sessions = self.list_sessions()?;
+        Ok(self.rank_sessions(sessions, caller_cwd, intent, false, limit))
+    }
+
+    pub fn current_repo_sessions(
+        &self,
+        caller_cwd: Option<&Path>,
+        intent: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<SessionResolveResult> {
+        let caller_cwd = caller_cwd
+            .map(Path::to_path_buf)
+            .or_else(|| std::env::current_dir().ok())
+            .ok_or_else(|| GreppleError::Tool("unable to determine caller cwd".to_string()))?;
+        let sessions = self.list_sessions()?;
+        let candidates =
+            self.rank_sessions(sessions, Some(caller_cwd.as_path()), intent, true, limit);
+        let session = candidates.first().cloned();
+        let mut warnings = Vec::new();
+        if session.is_none() {
+            warnings.push(Warning {
+                code: "NO_CURRENT_REPO_SESSION".to_string(),
+                message: "no grepple session matched the current repo/worktree".to_string(),
+                metadata: BTreeMap::new(),
+            });
+        }
+        Ok(SessionResolveResult {
+            session,
+            candidates,
+            warnings,
+        })
+    }
+
+    pub fn pick_best_session(
+        &self,
+        caller_cwd: Option<&Path>,
+        intent: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<SessionResolveResult> {
+        let sessions = self.list_sessions()?;
+        let candidates = self.rank_sessions(sessions, caller_cwd, intent, false, limit);
+        let session = candidates.first().cloned();
+        let mut warnings = Vec::new();
+        if let Some(selected) = &session {
+            warnings.extend(self.context_warnings(&selected.session, caller_cwd));
+        } else {
+            warnings.push(Warning {
+                code: "NO_SESSION_FOUND".to_string(),
+                message: "no grepple sessions available".to_string(),
+                metadata: BTreeMap::new(),
+            });
+        }
+        Ok(SessionResolveResult {
+            session,
+            candidates,
+            warnings,
+        })
     }
 
     pub fn session_status(
@@ -234,6 +304,142 @@ impl Grepple {
         log_ops::stats(path)
     }
 
+    pub fn log_error_counts(
+        &self,
+        req: LogErrorCountRequest,
+        caller_cwd: Option<&Path>,
+    ) -> Result<LogErrorCounts> {
+        let meta = self.store.read_meta(&req.session_id)?;
+        let path = self.stream_path(&meta, &req.stream)?;
+        let mut result = log_ops::error_counts(
+            path,
+            &LogErrorCountRequest {
+                max_scan_bytes: req
+                    .max_scan_bytes
+                    .min(self.config.max_search_scan_bytes)
+                    .max(1),
+                max_matches: req.max_matches.min(self.config.max_search_matches).max(1),
+                ..req
+            },
+        )?;
+        result.session_id = meta.session_id.clone();
+        if self.config.redact_output {
+            for m in &mut result.recent_matches {
+                m.line = self.redact_text(&m.line);
+            }
+        }
+        result
+            .warnings
+            .extend(self.context_warnings(&meta, caller_cwd));
+        Ok(result)
+    }
+
+    pub fn session_preset(
+        &self,
+        preset: SessionPresetKind,
+        session_id: &str,
+        stream: &str,
+        window_ms: Option<i64>,
+        caller_cwd: Option<&Path>,
+    ) -> Result<SessionPresetResult> {
+        let session = self.store.read_meta(session_id)?;
+        let mut warnings = self.context_warnings(&session, caller_cwd);
+        let stream = stream.to_string();
+        let tail;
+        let mut error_counts = None;
+        let summary = match preset {
+            SessionPresetKind::RecentErrors => {
+                let counts = self.log_error_counts(
+                    LogErrorCountRequest {
+                        session_id: session_id.to_string(),
+                        stream: stream.clone(),
+                        query: None,
+                        regex: false,
+                        case_sensitive: false,
+                        window_ms: Some(window_ms.unwrap_or(15 * 60 * 1000)),
+                        max_scan_bytes: self.config.max_search_scan_bytes,
+                        max_matches: 20,
+                    },
+                    caller_cwd,
+                )?;
+                warnings.extend(counts.warnings.clone());
+                let window_label = format_window_label(counts.window_ms);
+                let recent = counts.recent_matches.len();
+                error_counts = Some(counts);
+                tail = Some(self.log_tail(session_id, &stream, 80)?);
+                format!(
+                    "{} error-like lines in {}; showing {} recent matches",
+                    error_counts.as_ref().map(|v| v.matching_lines).unwrap_or(0),
+                    window_label,
+                    recent
+                )
+            }
+            SessionPresetKind::StartupFailures => {
+                let search = self.log_search(
+                    LogSearchRequest {
+                        session_id: session_id.to_string(),
+                        stream: stream.clone(),
+                        query: "error|panic|exception|traceback|failed|fatal".to_string(),
+                        regex: true,
+                        case_sensitive: false,
+                        start_offset: 0,
+                        max_scan_bytes: self.config.max_search_scan_bytes.min(256 * 1024),
+                        max_matches: 20,
+                    },
+                    caller_cwd,
+                )?;
+                warnings.extend(search.warnings.clone());
+                tail = Some(self.log_tail(session_id, &stream, 60)?);
+                format!(
+                    "{} startup failure matches in the beginning of the log",
+                    search.matches.len()
+                )
+            }
+            SessionPresetKind::WatchErrors => {
+                let counts = self.log_error_counts(
+                    LogErrorCountRequest {
+                        session_id: session_id.to_string(),
+                        stream: stream.clone(),
+                        query: None,
+                        regex: false,
+                        case_sensitive: false,
+                        window_ms: Some(window_ms.unwrap_or(5 * 60 * 1000)),
+                        max_scan_bytes: self.config.max_search_scan_bytes.min(512 * 1024),
+                        max_matches: 20,
+                    },
+                    caller_cwd,
+                )?;
+                warnings.extend(counts.warnings.clone());
+                tail = Some(self.log_tail(session_id, &stream, 120)?);
+                let window_label = format_window_label(counts.window_ms);
+                let matching = counts.matching_lines;
+                error_counts = Some(counts);
+                format!("{} recent watch-mode errors in {}", matching, window_label)
+            }
+            SessionPresetKind::SessionSummary => {
+                let stats = self.log_stats(session_id, &stream)?;
+                tail = Some(self.log_tail(session_id, &stream, 50)?);
+                format!(
+                    "{} is {} with {} lines and {} error-like lines",
+                    session.display_name,
+                    self.status_label(&session.status),
+                    stats.lines,
+                    stats.error_like_lines
+                )
+            }
+        };
+
+        Ok(SessionPresetResult {
+            preset,
+            session,
+            stream,
+            summary,
+            tail,
+            error_counts,
+            warnings: dedupe_warnings(warnings),
+        })
+    }
+
     pub fn install_client(
         &self,
         client: &str,
@@ -280,6 +486,246 @@ impl Grepple {
 
     pub fn clear_sessions(&self) -> Result<Vec<String>> {
         self.store.clear_all_sessions()
+    }
+
+    fn rank_sessions(
+        &self,
+        sessions: Vec<SessionMetadata>,
+        caller_cwd: Option<&Path>,
+        intent: Option<&str>,
+        current_repo_only: bool,
+        limit: Option<usize>,
+    ) -> Vec<RankedSession> {
+        let caller_git = caller_cwd.and_then(crate::runtime::capture_git_context);
+        let mut ranked = sessions
+            .into_iter()
+            .filter_map(|session| {
+                let candidate = self.rank_session(session, caller_cwd, caller_git.as_ref(), intent);
+                if current_repo_only
+                    && !candidate.repo_match
+                    && !candidate.worktree_match
+                    && !candidate.cwd_match
+                {
+                    return None;
+                }
+                Some(candidate)
+            })
+            .collect::<Vec<_>>();
+
+        ranked.sort_by(|a, b| {
+            b.score
+                .cmp(&a.score)
+                .then_with(|| b.session.last_activity_at.cmp(&a.session.last_activity_at))
+                .then_with(|| b.session.updated_at.cmp(&a.session.updated_at))
+                .then_with(|| b.session.created_at.cmp(&a.session.created_at))
+        });
+
+        if let Some(limit) = limit {
+            ranked.truncate(limit.max(1));
+        }
+
+        ranked
+    }
+
+    fn rank_session(
+        &self,
+        session: SessionMetadata,
+        caller_cwd: Option<&Path>,
+        caller_git: Option<&crate::model::GitContext>,
+        intent: Option<&str>,
+    ) -> RankedSession {
+        let mut score = 0_i64;
+        let mut reasons = Vec::new();
+
+        match session.status {
+            SessionStatus::Running => {
+                score += 500;
+                reasons.push("running session".to_string());
+            }
+            SessionStatus::Starting => {
+                score += 450;
+                reasons.push("starting session".to_string());
+            }
+            SessionStatus::Crashed | SessionStatus::Failed => {
+                score += 180;
+                reasons.push("recent failed session".to_string());
+            }
+            SessionStatus::Stopped => {
+                score += 60;
+            }
+        }
+
+        if session.provider == crate::model::SessionProvider::Managed {
+            score += 35;
+            reasons.push("managed process".to_string());
+        }
+
+        let running = matches!(
+            session.status,
+            SessionStatus::Running | SessionStatus::Starting
+        );
+
+        let mut repo_match = false;
+        let mut worktree_match = false;
+        let mut branch_match = false;
+        let mut cwd_match = false;
+
+        if let (Some(caller_git), Some(session_git)) = (caller_git, session.git_context.as_ref()) {
+            if caller_git.repo_root == session_git.repo_root {
+                repo_match = true;
+                score += 220;
+                reasons.push("same repo".to_string());
+            }
+            if caller_git.worktree_root == session_git.worktree_root {
+                worktree_match = true;
+                score += 260;
+                reasons.push("same worktree".to_string());
+            }
+            if caller_git.branch == session_git.branch {
+                branch_match = true;
+                score += 80;
+                reasons.push("same branch".to_string());
+            }
+        }
+
+        if let (Some(caller_cwd), Some(session_cwd)) = (caller_cwd, session.cwd.as_deref()) {
+            let session_path = Path::new(session_cwd);
+            if same_or_parent_path(caller_cwd, session_path)
+                || same_or_parent_path(session_path, caller_cwd)
+            {
+                cwd_match = true;
+                score += if caller_cwd == session_path { 190 } else { 120 };
+                reasons.push("near caller cwd".to_string());
+            }
+        }
+
+        let command_match = session
+            .command
+            .as_deref()
+            .map(|command| self.command_score(command, intent, &mut reasons))
+            .unwrap_or(0);
+        score += command_match;
+
+        let age = (Utc::now() - session.last_activity_at)
+            .num_minutes()
+            .clamp(0, 180);
+        score += 180 - age;
+
+        RankedSession {
+            session,
+            score,
+            repo_match,
+            worktree_match,
+            branch_match,
+            cwd_match,
+            running,
+            command_match: command_match > 0,
+            reasons,
+        }
+    }
+
+    fn command_score(&self, command: &str, intent: Option<&str>, reasons: &mut Vec<String>) -> i64 {
+        let lower = command.to_ascii_lowercase();
+        let mut score = 0_i64;
+
+        let command_patterns = [
+            "modal serve",
+            "pnpm dev",
+            "pnpm start",
+            "npm run dev",
+            "npm run start",
+            "yarn dev",
+            "yarn start",
+            "bun dev",
+            "bun start",
+            "uvicorn",
+            "flask run",
+            "manage.py runserver",
+            "vite",
+            "next dev",
+            "next start",
+            "webpack-dev-server",
+            "turbo dev",
+            "nodemon",
+            "docker compose up",
+            "docker-compose up",
+            "rails server",
+            "air ",
+        ];
+
+        if command_patterns
+            .iter()
+            .any(|pattern| lower.contains(pattern))
+        {
+            score += 120;
+            reasons.push("dev/runtime command".to_string());
+        }
+
+        if lower.contains("dev") || lower.contains("serve") || lower.contains("server") {
+            score += 30;
+        }
+
+        let intent = intent.unwrap_or_default().to_ascii_lowercase();
+        if !intent.is_empty() {
+            if intent.contains("frontend")
+                && ["vite", "next", "webpack", "frontend", "ui"]
+                    .iter()
+                    .any(|needle| lower.contains(needle))
+            {
+                score += 50;
+                reasons.push("frontend intent match".to_string());
+            }
+            if intent.contains("backend")
+                && ["uvicorn", "flask", "server", "api", "rails", "modal"]
+                    .iter()
+                    .any(|needle| lower.contains(needle))
+            {
+                score += 50;
+                reasons.push("backend intent match".to_string());
+            }
+            if [
+                "error", "logs", "stack", "trace", "runtime", "server", "watch",
+            ]
+            .iter()
+            .any(|needle| intent.contains(needle))
+            {
+                score += 25;
+            }
+        }
+
+        score
+    }
+
+    fn default_session_sort_key(
+        &self,
+        session: &SessionMetadata,
+    ) -> (
+        i8,
+        chrono::DateTime<Utc>,
+        chrono::DateTime<Utc>,
+        chrono::DateTime<Utc>,
+    ) {
+        (
+            match session.status {
+                SessionStatus::Running => 4,
+                SessionStatus::Starting => 3,
+                SessionStatus::Crashed | SessionStatus::Failed => 2,
+                SessionStatus::Stopped => 1,
+            },
+            session.last_activity_at,
+            session.updated_at,
+            session.created_at,
+        )
+    }
+
+    fn status_label(&self, status: &SessionStatus) -> &'static str {
+        match status {
+            SessionStatus::Starting => "starting",
+            SessionStatus::Running => "running",
+            SessionStatus::Stopped => "stopped",
+            SessionStatus::Failed => "failed",
+            SessionStatus::Crashed => "crashed",
+        }
     }
 
     fn stream_path<'a>(&self, meta: &'a SessionMetadata, stream: &str) -> Result<&'a Path> {
@@ -342,4 +788,35 @@ impl Grepple {
 
         output
     }
+}
+
+fn same_or_parent_path(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b || a.starts_with(&b) || b.starts_with(&a),
+        _ => a == b || a.starts_with(b) || b.starts_with(a),
+    }
+}
+
+fn format_window_label(window_ms: Option<i64>) -> String {
+    match window_ms {
+        Some(ms) if ms >= 60 * 60 * 1000 => format!("the last {}h", ms / (60 * 60 * 1000)),
+        Some(ms) if ms >= 60 * 1000 => format!("the last {}m", ms / (60 * 1000)),
+        Some(ms) if ms > 0 => format!("the last {}s", ms / 1000),
+        _ => "the scanned log window".to_string(),
+    }
+}
+
+fn dedupe_warnings(warnings: Vec<Warning>) -> Vec<Warning> {
+    let mut seen = BTreeMap::new();
+    let mut out = Vec::new();
+    for warning in warnings {
+        let key = format!(
+            "{}:{}:{:?}",
+            warning.code, warning.message, warning.metadata
+        );
+        if seen.insert(key, true).is_none() {
+            out.push(warning);
+        }
+    }
+    out
 }

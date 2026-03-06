@@ -85,6 +85,64 @@ pub struct LogStats {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RankedSession {
+    pub session: SessionMetadata,
+    pub score: i64,
+    pub repo_match: bool,
+    pub worktree_match: bool,
+    pub branch_match: bool,
+    pub cwd_match: bool,
+    pub running: bool,
+    pub command_match: bool,
+    pub reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionResolveResult {
+    pub session: Option<RankedSession>,
+    pub candidates: Vec<RankedSession>,
+    pub warnings: Vec<Warning>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogErrorCounts {
+    pub session_id: String,
+    pub stream: String,
+    pub bytes: u64,
+    pub lines: usize,
+    pub error_like_lines: usize,
+    pub matching_lines: usize,
+    pub timestamped_lines: usize,
+    pub scanned_from_offset: u64,
+    pub scanned_until_offset: u64,
+    pub window_ms: Option<i64>,
+    pub window_start: Option<DateTime<Utc>>,
+    pub window_end: Option<DateTime<Utc>>,
+    pub recent_matches: Vec<LogSearchMatch>,
+    pub warnings: Vec<Warning>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionPresetKind {
+    RecentErrors,
+    StartupFailures,
+    WatchErrors,
+    SessionSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionPresetResult {
+    pub preset: SessionPresetKind,
+    pub session: SessionMetadata,
+    pub stream: String,
+    pub summary: String,
+    pub tail: Option<String>,
+    pub error_counts: Option<LogErrorCounts>,
+    pub warnings: Vec<Warning>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Warning {
     pub code: String,
     pub message: String,
@@ -129,6 +187,18 @@ pub struct LogSearchRequest {
     pub regex: bool,
     pub case_sensitive: bool,
     pub start_offset: u64,
+    pub max_scan_bytes: usize,
+    pub max_matches: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct LogErrorCountRequest {
+    pub session_id: String,
+    pub stream: String,
+    pub query: Option<String>,
+    pub regex: bool,
+    pub case_sensitive: bool,
+    pub window_ms: Option<i64>,
     pub max_scan_bytes: usize,
     pub max_matches: usize,
 }

@@ -1,6 +1,8 @@
 # Grepple
 
 Grepple is a local session-centric terminal log observer for AI agents.
+It is designed to feel like the default tool for live local logs/processes: dev servers,
+backend/frontend runtimes, startup failures, and stack traces.
 
 It provides:
 - a CLI (`grepple`) for starting/attaching sessions and reading logs
@@ -133,6 +135,9 @@ OpenCode:
 grepple install opencode --scope user
 ```
 
+`grepple install opencode` now also adds a small instruction file so OpenCode prefers
+Grepple first for logs/errors/server/dev-server questions before broad code search.
+
 ## MCP Entry Point
 
 Run the server over stdio (default):
@@ -165,6 +170,8 @@ startup_timeout_sec = 30
 Grepple MCP exposes these core tools:
 - `session_list`
 - `session_status`
+- `current_repo_sessions`
+- `pick_best_session`
 - `session_start_command`
 - `session_attach`
 - `session_stop`
@@ -172,7 +179,15 @@ Grepple MCP exposes these core tools:
 - `log_search`
 - `log_tail`
 - `log_stats`
+- `log_error_counts`
+- `session_preset`
 - `install_client`
+
+The high-level debugging helpers are:
+- `pick_best_session`: resolve the most relevant running session for the current repo/worktree
+- `current_repo_sessions`: ranked current-repo candidates with match reasons
+- `log_error_counts`: first-class error counting with best-effort time-window support
+- `session_preset`: one-shot presets for `recent_errors`, `startup_failures`, `watch_errors`, and `session_summary`
 
 ## Environment Variables
 

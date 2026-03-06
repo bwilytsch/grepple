@@ -10,8 +10,8 @@ use crate::{
     app::Grepple,
     error::{GreppleError, Result},
     model::{
-        AttachSessionRequest, LogReadRequest, LogSearchRequest, StartSessionRequest,
-        StopSessionRequest, Warning,
+        AttachSessionRequest, LogErrorCountRequest, LogReadRequest, LogSearchRequest,
+        SessionPresetKind, StartSessionRequest, StopSessionRequest, Warning,
     },
 };
 
@@ -94,10 +94,10 @@ fn handle_request(app: &Grepple, msg: &Value) -> Result<Value> {
             },
             "serverInfo": {
                 "name": "grepple",
-                "title": "Grepple Terminal Log Observer",
+                "title": "Grepple: live local logs/processes",
                 "version": env!("CARGO_PKG_VERSION"),
             },
-            "instructions": "Use Grepple sessions to inspect runtime logs. Answer the user's question directly first (for yes/no questions, start with Yes or No). Keep the answer concise and include only the minimum evidence needed. Always check session status before deep log inspection: prefer the newest running/starting session and ignore older stopped sessions when an active newer one exists. Prefer log_read/log_search over shelling out.",
+            "instructions": "Use Grepple first for live local logs/processes: local server logs, dev server output, runtime errors, stack traces, and active backend/frontend sessions. When the user asks about logs, errors, a server, a dev server, or a stack trace, prefer Grepple session discovery before code search. Start with pick_best_session or current_repo_sessions using caller_cwd, prefer matching running sessions in the current repo/worktree, then use session_preset, log_error_counts, log_search, and log_read. Answer the user's question directly first (for yes/no questions, start with Yes or No) and keep only the minimum evidence needed.",
         })),
         "tools/list" => Ok(json!({"tools": tool_list()})),
         "prompts/list" => Ok(json!({"prompts": [
@@ -113,7 +113,7 @@ fn handle_request(app: &Grepple, msg: &Value) -> Result<Value> {
                     "role": "assistant",
                     "content": {
                         "type": "text",
-                        "text": "Call session_list first, then confirm the target with session_status. Prefer the newest running/starting session; if one exists, ignore older stopped sessions unless explicitly requested. Then use log_search and log_read incrementally by offsets. In the final response, answer the user's question in the first sentence (Yes/No when applicable), then add brief evidence."
+                        "text": "For logs/errors/server/dev server/stack trace prompts, call pick_best_session or current_repo_sessions first with caller_cwd. Prefer matching running sessions in the current repo/worktree; only fall back to stopped sessions when needed. Use session_preset for common debugging flows, log_error_counts for recent error counts, then log_search/log_read incrementally by offsets. In the final response, answer the user's question in the first sentence (Yes/No when applicable), then add brief evidence."
                     }
                 }
             ]
@@ -139,11 +139,38 @@ fn handle_tool_call(app: &Grepple, msg: &Value) -> Result<Value> {
     let caller_cwd = parse_caller_cwd(&args).or_else(|| std::env::current_dir().ok());
 
     let payload = match name {
-        "session_list" => json!({"sessions": app.list_sessions()?}),
+        "session_list" => {
+            let intent = optional_string(&args, "intent");
+            let limit = optional_usize(&args, "limit");
+            let include_scores = args
+                .get("include_scores")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if include_scores {
+                json!({"sessions": app.list_ranked_sessions(caller_cwd.as_deref(), intent.as_deref(), limit)?})
+            } else {
+                let sessions = app
+                    .list_ranked_sessions(caller_cwd.as_deref(), intent.as_deref(), limit)?
+                    .into_iter()
+                    .map(|ranked| ranked.session)
+                    .collect::<Vec<_>>();
+                json!({"sessions": sessions})
+            }
+        }
         "session_status" => {
             let session_id = required_string(&args, "session_id")?;
             let (meta, warnings) = app.session_status(&session_id, caller_cwd.as_deref())?;
             json!({"session": meta, "warnings": warnings})
+        }
+        "current_repo_sessions" => {
+            let intent = optional_string(&args, "intent");
+            let limit = optional_usize(&args, "limit");
+            json!(app.current_repo_sessions(caller_cwd.as_deref(), intent.as_deref(), limit,)?)
+        }
+        "pick_best_session" => {
+            let intent = optional_string(&args, "intent");
+            let limit = optional_usize(&args, "limit");
+            json!(app.pick_best_session(caller_cwd.as_deref(), intent.as_deref(), limit,)?)
         }
         "session_start_command" => {
             let command = required_string(&args, "command")?;
@@ -288,6 +315,7 @@ fn handle_tool_call(app: &Grepple, msg: &Value) -> Result<Value> {
             let lines = args.get("lines").and_then(Value::as_u64).unwrap_or(200) as usize;
             let raw = args.get("raw").and_then(Value::as_bool).unwrap_or(false);
             let text_max_chars = mcp_text_max_chars(&args);
+            let (_, warnings) = app.session_status(&session_id, caller_cwd.as_deref())?;
             let tail = app.log_tail(&session_id, &stream, lines)?;
             let shaped = shape_log_text(&tail, raw, text_max_chars, TruncateKeep::End);
             json!({
@@ -295,13 +323,89 @@ fn handle_tool_call(app: &Grepple, msg: &Value) -> Result<Value> {
                 "tail_sanitized": shaped.cleaned,
                 "tail_truncated": shaped.truncated,
                 "tail_original_chars": shaped.original_chars,
-                "tail_returned_chars": shaped.returned_chars
+                "tail_returned_chars": shaped.returned_chars,
+                "warnings": warnings,
             })
         }
         "log_stats" => {
             let session_id = required_string(&args, "session_id")?;
             let stream = optional_string(&args, "stream").unwrap_or_else(|| "combined".to_string());
-            json!(app.log_stats(&session_id, &stream)?)
+            let (_, warnings) = app.session_status(&session_id, caller_cwd.as_deref())?;
+            json!({
+                "stats": app.log_stats(&session_id, &stream)?,
+                "warnings": warnings,
+            })
+        }
+        "log_error_counts" => {
+            let session_id = optional_string(&args, "session_id")
+                .or_else(|| {
+                    resolve_best_session_id(
+                        app,
+                        caller_cwd.as_deref(),
+                        optional_string(&args, "intent").as_deref(),
+                    )
+                    .ok()
+                })
+                .ok_or_else(|| {
+                    GreppleError::Tool(
+                        "missing session_id and could not resolve a best session".to_string(),
+                    )
+                })?;
+            let stream = optional_string(&args, "stream").unwrap_or_else(|| "combined".to_string());
+            let query = optional_string(&args, "query");
+            let regex = args.get("regex").and_then(Value::as_bool).unwrap_or(false);
+            let case_sensitive = args
+                .get("case_sensitive")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let window_ms = optional_i64(&args, "window_ms");
+            let max_scan_bytes = args
+                .get("max_scan_bytes")
+                .and_then(Value::as_u64)
+                .unwrap_or(1024 * 1024) as usize;
+            let max_matches = args
+                .get("max_matches")
+                .and_then(Value::as_u64)
+                .unwrap_or(20) as usize;
+            json!(app.log_error_counts(
+                LogErrorCountRequest {
+                    session_id,
+                    stream,
+                    query,
+                    regex,
+                    case_sensitive,
+                    window_ms,
+                    max_scan_bytes,
+                    max_matches,
+                },
+                caller_cwd.as_deref(),
+            )?)
+        }
+        "session_preset" => {
+            let preset = parse_preset(&required_string(&args, "preset")?)?;
+            let session_id = optional_string(&args, "session_id")
+                .or_else(|| {
+                    resolve_best_session_id(
+                        app,
+                        caller_cwd.as_deref(),
+                        optional_string(&args, "intent").as_deref(),
+                    )
+                    .ok()
+                })
+                .ok_or_else(|| {
+                    GreppleError::Tool(
+                        "missing session_id and could not resolve a best session".to_string(),
+                    )
+                })?;
+            let stream = optional_string(&args, "stream").unwrap_or_else(|| "combined".to_string());
+            let window_ms = optional_i64(&args, "window_ms");
+            json!(app.session_preset(
+                preset,
+                &session_id,
+                &stream,
+                window_ms,
+                caller_cwd.as_deref(),
+            )?)
         }
         "install_client" => {
             let client = required_string(&args, "client")?;
@@ -358,26 +462,107 @@ fn parse_env_map(value: &Value) -> Vec<(String, String)> {
     out
 }
 
+fn optional_usize(value: &Value, key: &str) -> Option<usize> {
+    value.get(key).and_then(Value::as_u64).map(|v| v as usize)
+}
+
+fn optional_i64(value: &Value, key: &str) -> Option<i64> {
+    value.get(key).and_then(Value::as_i64)
+}
+
+fn resolve_best_session_id(
+    app: &Grepple,
+    caller_cwd: Option<&std::path::Path>,
+    intent: Option<&str>,
+) -> Result<String> {
+    app.pick_best_session(caller_cwd, intent, Some(5))?
+        .session
+        .map(|ranked| ranked.session.session_id)
+        .ok_or_else(|| GreppleError::Tool("no grepple session available".to_string()))
+}
+
+fn parse_preset(value: &str) -> Result<SessionPresetKind> {
+    match value {
+        "recent_errors" => Ok(SessionPresetKind::RecentErrors),
+        "startup_failures" => Ok(SessionPresetKind::StartupFailures),
+        "watch_errors" => Ok(SessionPresetKind::WatchErrors),
+        "session_summary" => Ok(SessionPresetKind::SessionSummary),
+        other => Err(GreppleError::InvalidArgument(format!(
+            "invalid preset '{other}' (expected recent_errors|startup_failures|watch_errors|session_summary)"
+        ))),
+    }
+}
+
+fn caller_cwd_property() -> Value {
+    json!({
+        "type": "string",
+        "description": "current repo/worktree cwd; pass this for better session matching"
+    })
+}
+
 fn tool_list() -> Vec<Value> {
     vec![
         tool(
             "session_list",
-            "List sessions",
-            "List grepple sessions with status and git context",
+            "Grepple Sessions",
+            "Grepple: list live local logs/processes, optionally ranked for the current repo/worktree",
             tool_hints(true, false, true),
-            json!({"type": "object", "properties": {}}),
+            json!({
+                "type": "object",
+                "properties": {
+                    "caller_cwd": caller_cwd_property(),
+                    "intent": {"type": "string", "description": "hint such as logs, errors, dev_server, backend, frontend, stack_trace"},
+                    "limit": {"type": "number"},
+                    "include_scores": {"type": "boolean", "description": "include ranking metadata in the response"}
+                }
+            }),
         ),
         tool(
             "session_status",
-            "Session status",
-            "Get one session status",
+            "Grepple Session Status",
+            "Grepple: inspect one local session with repo/worktree mismatch warnings",
             tool_hints(true, false, true),
-            json!({"type": "object", "required": ["session_id"], "properties": {"session_id": {"type": "string"}}}),
+            json!({
+                "type": "object",
+                "required": ["session_id"],
+                "properties": {
+                    "session_id": {"type": "string"},
+                    "caller_cwd": caller_cwd_property()
+                }
+            }),
+        ),
+        tool(
+            "current_repo_sessions",
+            "Grepple Current Repo",
+            "Grepple: ranked live local logs/processes for the current repo/worktree",
+            tool_hints(true, false, true),
+            json!({
+                "type": "object",
+                "properties": {
+                    "caller_cwd": caller_cwd_property(),
+                    "intent": {"type": "string"},
+                    "limit": {"type": "number"}
+                }
+            }),
+        ),
+        tool(
+            "pick_best_session",
+            "Grepple Pick Best",
+            "Grepple: pick the best live local logs/process for a log/debug question",
+            tool_hints(true, false, true),
+            json!({
+                "type": "object",
+                "properties": {
+                    "caller_cwd": caller_cwd_property(),
+                    "intent": {"type": "string"},
+                    "limit": {"type": "number"}
+                }
+            }),
         ),
         tool(
             "session_start_command",
-            "Start command",
-            "Start a managed command session",
+            "Grepple Start Command",
+            "Grepple: start a managed local process and capture its runtime logs",
             tool_hints(false, true, false),
             json!({
                 "type": "object",
@@ -392,28 +577,29 @@ fn tool_list() -> Vec<Value> {
         ),
         tool(
             "session_attach",
-            "Attach tmux",
-            "Attach to tmux pane and create session snapshot",
+            "Grepple Attach Tmux",
+            "Grepple: attach to a tmux pane and capture local runtime output",
             tool_hints(false, false, false),
             json!({"type": "object", "properties": {"target": {"type": "string"}, "name": {"type": "string"}}}),
         ),
         tool(
             "session_stop",
-            "Stop session",
-            "Stop a managed session process group",
+            "Grepple Stop Session",
+            "Grepple: stop a managed local process group",
             tool_hints(false, true, true),
             json!({"type": "object", "required": ["session_id"], "properties": {"session_id": {"type": "string"}, "grace_ms": {"type": "number"}}}),
         ),
         tool(
             "log_read",
-            "Read logs",
-            "Read logs incrementally by byte offset",
+            "Grepple Read Logs",
+            "Grepple: read local server/dev/runtime logs incrementally by byte offset",
             tool_hints(true, false, true),
             json!({
                 "type": "object",
                 "required": ["session_id"],
                 "properties": {
                     "session_id": {"type":"string"},
+                    "caller_cwd": caller_cwd_property(),
                     "stream": {"type":"string", "enum": ["stdout", "stderr", "combined"]},
                     "offset": {"type":"number"},
                     "max_bytes": {"type":"number"},
@@ -424,14 +610,15 @@ fn tool_list() -> Vec<Value> {
         ),
         tool(
             "log_search",
-            "Search logs",
-            "Search logs using plain text or regex",
+            "Grepple Search Logs",
+            "Grepple: search local server/dev/runtime logs using plain text or regex",
             tool_hints(true, false, true),
             json!({
                 "type": "object",
                 "required": ["session_id", "query"],
                 "properties": {
                     "session_id": {"type":"string"},
+                    "caller_cwd": caller_cwd_property(),
                     "stream": {"type":"string", "enum": ["stdout", "stderr", "combined"]},
                     "query": {"type":"string"},
                     "regex": {"type":"boolean"},
@@ -446,14 +633,15 @@ fn tool_list() -> Vec<Value> {
         ),
         tool(
             "log_tail",
-            "Tail logs",
-            "Read the last N lines from a stream",
+            "Grepple Tail Logs",
+            "Grepple: read the latest local runtime log lines from a stream",
             tool_hints(true, false, true),
             json!({
                 "type":"object",
                 "required": ["session_id"],
                 "properties": {
                     "session_id": {"type":"string"},
+                    "caller_cwd": caller_cwd_property(),
                     "stream": {"type":"string"},
                     "lines": {"type":"number"},
                     "max_chars": {"type":"number", "description": "max characters returned in tail (default 12000)"},
@@ -463,15 +651,62 @@ fn tool_list() -> Vec<Value> {
         ),
         tool(
             "log_stats",
-            "Log stats",
-            "Compute line and error-like counts for a stream",
+            "Grepple Log Stats",
+            "Grepple: compute line and error-like counts for a local runtime log stream",
             tool_hints(true, false, true),
-            json!({"type":"object", "required": ["session_id"], "properties": {"session_id": {"type":"string"}, "stream": {"type":"string"}}}),
+            json!({
+                "type":"object",
+                "required": ["session_id"],
+                "properties": {
+                    "session_id": {"type":"string"},
+                    "caller_cwd": caller_cwd_property(),
+                    "stream": {"type":"string"}
+                }
+            }),
+        ),
+        tool(
+            "log_error_counts",
+            "Grepple Error Counts",
+            "Grepple: count recent runtime errors, with optional time-window support and sample matches",
+            tool_hints(true, false, true),
+            json!({
+                "type":"object",
+                "properties": {
+                    "session_id": {"type":"string", "description": "optional if caller_cwd can resolve the best session"},
+                    "caller_cwd": caller_cwd_property(),
+                    "intent": {"type":"string"},
+                    "stream": {"type":"string", "enum": ["stdout", "stderr", "combined"]},
+                    "query": {"type":"string", "description": "optional custom query; defaults to error-like matching"},
+                    "regex": {"type":"boolean"},
+                    "case_sensitive": {"type":"boolean"},
+                    "window_ms": {"type":"number", "description": "best-effort recent time window in milliseconds when timestamps are present"},
+                    "max_scan_bytes": {"type":"number"},
+                    "max_matches": {"type":"number"}
+                }
+            }),
+        ),
+        tool(
+            "session_preset",
+            "Grepple Debug Preset",
+            "Grepple: one-shot debugging presets like recent_errors, startup_failures, watch_errors, and session_summary",
+            tool_hints(true, false, true),
+            json!({
+                "type":"object",
+                "required": ["preset"],
+                "properties": {
+                    "preset": {"type":"string", "enum": ["recent_errors", "startup_failures", "watch_errors", "session_summary"]},
+                    "session_id": {"type":"string", "description": "optional if caller_cwd can resolve the best session"},
+                    "caller_cwd": caller_cwd_property(),
+                    "intent": {"type":"string"},
+                    "stream": {"type":"string", "enum": ["stdout", "stderr", "combined"]},
+                    "window_ms": {"type":"number"}
+                }
+            }),
         ),
         tool(
             "install_client",
-            "Install client",
-            "Install grepple into codex, claude, or opencode",
+            "Grepple Install Client",
+            "Grepple: install into codex, claude, or opencode with local-log guidance",
             tool_hints(false, true, false),
             json!({
                 "type": "object",
@@ -858,5 +1093,22 @@ mod tests {
             .expect("session_start_command tool");
         assert_eq!(session_start["annotations"]["readOnlyHint"], false);
         assert_eq!(session_start["annotations"]["destructiveHint"], true);
+
+        let pick_best = tools
+            .iter()
+            .find(|t| t["name"] == "pick_best_session")
+            .expect("pick_best_session tool");
+        assert!(
+            pick_best["description"]
+                .as_str()
+                .expect("description")
+                .contains("live local logs/process")
+        );
+
+        let session_list = tools
+            .iter()
+            .find(|t| t["name"] == "session_list")
+            .expect("session_list tool");
+        assert!(session_list["inputSchema"]["properties"]["caller_cwd"].is_object());
     }
 }
