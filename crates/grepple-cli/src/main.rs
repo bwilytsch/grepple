@@ -9,7 +9,7 @@ use grepple_core::{
     Grepple, GreppleConfig, mcp,
     model::{
         AttachSessionRequest, InstallerResult, LogReadRequest, LogSearchRequest,
-        StartSessionRequest, StopSessionRequest,
+        StartSessionRequest, StartShellSessionRequest, StopSessionRequest,
     },
     runtime::list_tmux_panes,
 };
@@ -30,7 +30,7 @@ mod tui;
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -153,12 +153,12 @@ fn run() -> Result<()> {
     let cli = Cli::parse();
 
     match &cli.command {
-        Commands::Mcp => {
+        Some(Commands::Mcp) => {
             let app = Grepple::new_for_mcp(GreppleConfig::default())?;
             mcp::serve_stdio(&app).context("running MCP server")?;
             return Ok(());
         }
-        Commands::Shell { command } => {
+        Some(Commands::Shell { command }) => {
             print_shell_command(command);
             return Ok(());
         }
@@ -168,13 +168,25 @@ fn run() -> Result<()> {
     let app = Grepple::new(GreppleConfig::default())?;
 
     match cli.command {
-        Commands::Run {
+        None => {
+            let meta = app.start_shell_session(StartShellSessionRequest {
+                name: None,
+                cwd: None,
+            })?;
+            if meta.exit_code.unwrap_or_default() != 0 {
+                return Err(anyhow::anyhow!(
+                    "shell exited with status {}",
+                    meta.exit_code.unwrap_or_default()
+                ));
+            }
+        }
+        Some(Commands::Run {
             name,
             cwd,
             env,
             detached,
             command,
-        } => {
+        }) => {
             let command = shell_join(&command);
             let env = parse_env_pairs(env)?;
             let meta = app.start_session(StartSessionRequest {
@@ -199,7 +211,7 @@ fn run() -> Result<()> {
                 ));
             }
         }
-        Commands::Attach { name, target } => {
+        Some(Commands::Attach { name, target }) => {
             let target = resolve_attach_target(target)?;
             let meta = app.attach_session(AttachSessionRequest { name, target })?;
             println!(
@@ -209,7 +221,7 @@ fn run() -> Result<()> {
                 meta.provider_ref.unwrap_or_default()
             );
         }
-        Commands::Sessions { command, json } => match command {
+        Some(Commands::Sessions { command, json }) => match command {
             Some(SessionsCommands::Clear { yes }) => {
                 if json {
                     anyhow::bail!("--json is not supported for 'sessions clear'");
@@ -231,7 +243,7 @@ fn run() -> Result<()> {
                 }
             }
         },
-        Commands::Logs {
+        Some(Commands::Logs {
             session_id,
             stream,
             offset,
@@ -240,7 +252,7 @@ fn run() -> Result<()> {
             search,
             regex,
             case_sensitive,
-        } => {
+        }) => {
             if let Some(lines) = tail {
                 let out = app.log_tail(&session_id, &stream, lines)?;
                 println!("{out}");
@@ -277,17 +289,17 @@ fn run() -> Result<()> {
             print!("{}", out.chunk);
             eprintln!("\nnext_offset={} eof={}", out.next_offset, out.eof);
         }
-        Commands::Stop {
+        Some(Commands::Stop {
             session_id,
             grace_ms,
-        } => {
+        }) => {
             let meta = app.stop_session(StopSessionRequest {
                 session_id,
                 grace_ms,
             })?;
             println!("stopped {} ({})", meta.session_id, meta.display_name);
         }
-        Commands::Add {
+        Some(Commands::Add {
             client,
             name,
             env,
@@ -295,8 +307,8 @@ fn run() -> Result<()> {
             force,
             scope,
             json,
-        }
-        | Commands::Install {
+        })
+        | Some(Commands::Install {
             client,
             name,
             env,
@@ -304,7 +316,7 @@ fn run() -> Result<()> {
             force,
             scope,
             json,
-        } => {
+        }) => {
             let env = parse_env_pairs(env)?;
             let use_line_ui = !dry_run && !json && std::io::stdout().is_terminal();
             let out = if use_line_ui {
@@ -327,8 +339,8 @@ fn run() -> Result<()> {
                 anyhow::bail!("installer failed: {}", out.details);
             }
         }
-        Commands::Shell { .. } => unreachable!("handled before app initialization"),
-        Commands::Mcp => unreachable!("handled before app initialization"),
+        Some(Commands::Shell { .. }) => unreachable!("handled before app initialization"),
+        Some(Commands::Mcp) => unreachable!("handled before app initialization"),
     }
 
     Ok(())
@@ -601,7 +613,15 @@ fn truncate(value: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ShellFlavor, shell_init_snippet};
+    use clap::Parser;
+
+    use super::{Cli, ShellFlavor, shell_init_snippet};
+
+    #[test]
+    fn bare_cli_defaults_to_no_subcommand() {
+        let cli = Cli::parse_from(["grepple"]);
+        assert!(cli.command.is_none());
+    }
 
     #[test]
     fn shell_init_zsh_contains_alias_and_helper() {

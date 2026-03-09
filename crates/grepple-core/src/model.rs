@@ -19,7 +19,14 @@ pub enum SessionStatus {
 #[serde(rename_all = "snake_case")]
 pub enum SessionProvider {
     Managed,
+    ShellPty,
     TmuxAttach,
+}
+
+impl SessionProvider {
+    pub fn has_process_control(&self) -> bool {
+        matches!(self, Self::Managed | Self::ShellPty)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -160,6 +167,12 @@ pub struct StartSessionRequest {
     pub command: String,
     pub env: Vec<(String, String)>,
     pub foreground: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct StartShellSessionRequest {
+    pub name: Option<String>,
+    pub cwd: Option<String>,
 }
 
 #[derive(Debug, Clone)]

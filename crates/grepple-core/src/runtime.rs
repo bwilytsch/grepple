@@ -3,6 +3,7 @@ use std::{
     fs::OpenOptions,
     io::{Read, Write},
     mem,
+    os::unix::process::ExitStatusExt,
     path::{Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
     ptr,
@@ -21,7 +22,7 @@ use crate::{
     error::{GreppleError, Result},
     model::{
         AttachSessionRequest, GitContext, SCHEMA_VERSION, SessionMetadata, SessionProvider,
-        SessionStatus, StartSessionRequest, StopSessionRequest,
+        SessionStatus, StartSessionRequest, StartShellSessionRequest, StopSessionRequest,
     },
     storage::SessionStore,
 };
@@ -200,6 +201,113 @@ pub fn start_managed_session(
     Ok(meta)
 }
 
+pub fn start_shell_session(
+    store: &SessionStore,
+    req: StartShellSessionRequest,
+) -> Result<SessionMetadata> {
+    ensure_interactive_terminal()?;
+
+    let session_id = store.allocate_session_id();
+    let (stdout_path, stderr_path, combined_path) = store.create_session_files(&session_id)?;
+
+    let now = Utc::now();
+    let cwd = req.cwd.clone().unwrap_or_else(|| {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .display()
+            .to_string()
+    });
+    let shell = resolve_shell();
+    let shell_name = Path::new(&shell)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("shell")
+        .to_string();
+    let shell_command = format!("{} -i -l", shell_name);
+    let auto_name = build_default_name(req.name.clone(), &cwd, None, Some(&shell_command));
+    let slug = format!(
+        "{}-{}",
+        auto_name.replace(' ', "-"),
+        &session_id[..4].to_lowercase()
+    );
+
+    let (pid, master_fd) = spawn_shell_pty(&shell, &cwd)?;
+
+    let mut stdout_marker = OpenOptions::new().append(true).open(&stdout_path)?;
+    let mut combined_marker = OpenOptions::new().append(true).open(&combined_path)?;
+    let marker = format!(
+        "[{}] grepple shell session started: {} (pid={})\n",
+        now.to_rfc3339(),
+        shell_command,
+        pid
+    );
+    stdout_marker.write_all(marker.as_bytes())?;
+    combined_marker.write_all(marker.as_bytes())?;
+
+    let mut meta = SessionMetadata {
+        schema_version: SCHEMA_VERSION,
+        session_id: session_id.clone(),
+        session_slug: slug,
+        display_name: auto_name,
+        status: SessionStatus::Running,
+        provider: SessionProvider::ShellPty,
+        cwd: Some(cwd.clone()),
+        command: Some(shell_command.clone()),
+        pid: Some(pid),
+        exit_code: None,
+        created_at: now,
+        updated_at: now,
+        last_activity_at: now,
+        stopped_at: None,
+        summary_last_line: None,
+        stdout_path: stdout_path.display().to_string(),
+        stderr_path: stderr_path.display().to_string(),
+        combined_path: combined_path.display().to_string(),
+        git_context: capture_git_context(Path::new(&cwd)),
+        provider_ref: None,
+        labels: vec!["shell".to_string()],
+    };
+
+    meta.summary_last_line = store.update_summary_from_combined(&session_id)?;
+    store.write_meta(&meta)?;
+    store.append_event(
+        &session_id,
+        "session_started",
+        json!({
+            "pid": pid,
+            "provider": "shell_pty",
+            "cwd": cwd,
+            "shell": shell,
+        }),
+    )?;
+
+    let run_result = {
+        let _terminal_guard = TerminalModeGuard::enter()?;
+        sync_pty_window_size(master_fd)?;
+        pump_shell_pty(
+            store,
+            &session_id,
+            pid,
+            master_fd,
+            &stdout_path,
+            &combined_path,
+        )
+    };
+    restore_terminal_state();
+    let _ = unsafe { libc::close(master_fd) };
+
+    match run_result {
+        Ok(status_raw) => mark_session_exited(store, &session_id, ExitStatus::from_raw(status_raw)),
+        Err(err) => {
+            let _ = signal_process_group(pid, libc::SIGTERM);
+            if let Ok(status_raw) = wait_for_pid(pid) {
+                let _ = mark_session_exited(store, &session_id, ExitStatus::from_raw(status_raw));
+            }
+            Err(err)
+        }
+    }
+}
+
 pub fn attach_tmux_session(
     store: &SessionStore,
     req: AttachSessionRequest,
@@ -310,7 +418,7 @@ pub fn stop_session(
 ) -> Result<SessionMetadata> {
     let mut meta = store.read_meta(&req.session_id)?;
 
-    if meta.provider != SessionProvider::Managed {
+    if !meta.provider.has_process_control() {
         meta.status = SessionStatus::Stopped;
         meta.stopped_at = Some(Utc::now());
         meta.updated_at = Utc::now();
@@ -360,7 +468,7 @@ pub fn stop_session(
 
 pub fn refresh_status(store: &SessionStore, session_id: &str) -> Result<SessionMetadata> {
     let mut meta = store.read_meta(session_id)?;
-    if meta.provider == SessionProvider::Managed
+    if meta.provider.has_process_control()
         && matches!(
             meta.status,
             SessionStatus::Starting | SessionStatus::Running
@@ -502,6 +610,252 @@ fn normalize_path(path: String) -> String {
     std::fs::canonicalize(&path)
         .map(|p| p.display().to_string())
         .unwrap_or(path)
+}
+
+fn ensure_interactive_terminal() -> Result<()> {
+    let stdin_tty = unsafe { libc::isatty(libc::STDIN_FILENO) } == 1;
+    let stdout_tty = unsafe { libc::isatty(libc::STDOUT_FILENO) } == 1;
+    if stdin_tty && stdout_tty {
+        return Ok(());
+    }
+    Err(GreppleError::InvalidArgument(
+        "interactive shell sessions require a terminal; use 'grepple run -- <command>' for non-interactive commands"
+            .to_string(),
+    ))
+}
+
+fn resolve_shell() -> String {
+    std::env::var("SHELL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "/bin/sh".to_string())
+}
+
+fn spawn_shell_pty(shell: &str, cwd: &str) -> Result<(i32, i32)> {
+    let shell_path = CString::new(shell)
+        .map_err(|_| GreppleError::InvalidArgument("shell path contains NUL byte".to_string()))?;
+    let shell_name = Path::new(shell)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("shell")
+        .to_string();
+    let argv0 = CString::new(shell_name)
+        .map_err(|_| GreppleError::InvalidArgument("shell name contains NUL byte".to_string()))?;
+    let arg_interactive = CString::new("-i").expect("static string");
+    let arg_login = CString::new("-l").expect("static string");
+    let cwd_cstr = CString::new(cwd)
+        .map_err(|_| GreppleError::InvalidArgument("cwd contains NUL byte".to_string()))?;
+
+    let mut master_fd = 0;
+    let mut termios = current_terminal_mode().ok();
+    let mut winsize = current_terminal_size().ok();
+    let pid = unsafe {
+        libc::forkpty(
+            &mut master_fd,
+            ptr::null_mut(),
+            termios
+                .as_mut()
+                .map_or(ptr::null_mut(), |value| value as *mut libc::termios),
+            winsize
+                .as_mut()
+                .map_or(ptr::null_mut(), |value| value as *mut libc::winsize),
+        )
+    };
+    if pid < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+
+    if pid == 0 {
+        unsafe {
+            let _ = libc::setpgid(0, 0);
+            if libc::chdir(cwd_cstr.as_ptr()) != 0 {
+                libc::_exit(1);
+            }
+            let argv = [
+                argv0.as_ptr(),
+                arg_interactive.as_ptr(),
+                arg_login.as_ptr(),
+                ptr::null(),
+            ];
+            libc::execvp(shell_path.as_ptr(), argv.as_ptr());
+            libc::_exit(127);
+        }
+    }
+
+    Ok((pid, master_fd))
+}
+
+fn pump_shell_pty(
+    store: &SessionStore,
+    session_id: &str,
+    pid: i32,
+    master_fd: i32,
+    stdout_path: &Path,
+    combined_path: &Path,
+) -> Result<i32> {
+    let mut stdout_file = OpenOptions::new().append(true).open(stdout_path)?;
+    let mut combined_file = OpenOptions::new().append(true).open(combined_path)?;
+    let mut buffer = [0_u8; 8192];
+    let mut last_touch = Instant::now() - Duration::from_secs(2);
+
+    loop {
+        let _ = sync_pty_window_size(master_fd);
+
+        let mut fds = [
+            libc::pollfd {
+                fd: master_fd,
+                events: libc::POLLIN | libc::POLLHUP,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: libc::STDIN_FILENO,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+
+        let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 100) };
+        if rc < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err.into());
+        }
+
+        if fds[0].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+            let read_n = unsafe { libc::read(master_fd, buffer.as_mut_ptr().cast(), buffer.len()) };
+            if read_n == 0 {
+                break;
+            }
+            if read_n < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                if err.raw_os_error() == Some(libc::EIO) {
+                    break;
+                }
+                return Err(err.into());
+            }
+
+            let chunk = &buffer[..read_n as usize];
+            let mut out = std::io::stdout();
+            out.write_all(chunk)?;
+            out.flush()?;
+            stdout_file.write_all(chunk)?;
+            combined_file.write_all(chunk)?;
+
+            if last_touch.elapsed() >= Duration::from_secs(1) {
+                let _ = touch_session_activity(store, session_id);
+                last_touch = Instant::now();
+            }
+        }
+
+        if fds[1].revents & libc::POLLIN != 0 {
+            let read_n =
+                unsafe { libc::read(libc::STDIN_FILENO, buffer.as_mut_ptr().cast(), buffer.len()) };
+            if read_n < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(err.into());
+            }
+            if read_n > 0 {
+                write_all_fd(master_fd, &buffer[..read_n as usize])?;
+            }
+        }
+    }
+
+    wait_for_pid(pid)
+}
+
+fn write_all_fd(fd: i32, mut chunk: &[u8]) -> Result<()> {
+    while !chunk.is_empty() {
+        let written = unsafe { libc::write(fd, chunk.as_ptr().cast(), chunk.len()) };
+        if written < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err.into());
+        }
+        chunk = &chunk[written as usize..];
+    }
+    Ok(())
+}
+
+fn wait_for_pid(pid: i32) -> Result<i32> {
+    loop {
+        let mut status = 0;
+        let rc = unsafe { libc::waitpid(pid, &mut status, 0) };
+        if rc < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err.into());
+        }
+        return Ok(status);
+    }
+}
+
+fn current_terminal_mode() -> Result<libc::termios> {
+    let mut termios = unsafe { mem::zeroed::<libc::termios>() };
+    let rc = unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut termios) };
+    if rc == 0 {
+        Ok(termios)
+    } else {
+        Err(std::io::Error::last_os_error().into())
+    }
+}
+
+fn current_terminal_size() -> Result<libc::winsize> {
+    let mut winsize = unsafe { mem::zeroed::<libc::winsize>() };
+    let rc = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut winsize) };
+    if rc == 0 {
+        Ok(winsize)
+    } else {
+        Err(std::io::Error::last_os_error().into())
+    }
+}
+
+fn sync_pty_window_size(master_fd: i32) -> Result<()> {
+    let mut winsize = current_terminal_size()?;
+    let rc = unsafe { libc::ioctl(master_fd, libc::TIOCSWINSZ, &mut winsize) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error().into())
+    }
+}
+
+struct TerminalModeGuard {
+    original: libc::termios,
+}
+
+impl TerminalModeGuard {
+    fn enter() -> Result<Self> {
+        let original = current_terminal_mode()?;
+        let mut raw = original;
+        unsafe {
+            libc::cfmakeraw(&mut raw);
+        }
+        let rc = unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(Self { original })
+    }
+}
+
+impl Drop for TerminalModeGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.original);
+        }
+    }
 }
 
 fn touch_session_activity(store: &SessionStore, session_id: &str) -> Result<()> {

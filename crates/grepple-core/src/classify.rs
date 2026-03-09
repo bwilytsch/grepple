@@ -66,9 +66,11 @@ pub fn label_score(labels: &[String], intent: Option<&str>) -> (i64, Vec<String>
         reasons.push("backend intent match".to_string());
     }
 
-    if ["error", "logs", "stack", "trace", "runtime", "server", "watch"]
-        .iter()
-        .any(|needle| intent.contains(needle))
+    if [
+        "error", "logs", "stack", "trace", "runtime", "server", "watch",
+    ]
+    .iter()
+    .any(|needle| intent.contains(needle))
     {
         score += 25;
     }
@@ -141,8 +143,7 @@ fn is_dev_server(lower: &str) -> bool {
 
 fn is_frontend(lower: &str) -> bool {
     [
-        "vite", "next", "webpack", "turbo", "frontend", "ui", "remix", "nuxt", "astro",
-        "svelte",
+        "vite", "next", "webpack", "turbo", "frontend", "ui", "remix", "nuxt", "astro", "svelte",
     ]
     .iter()
     .any(|needle| lower.contains(needle))

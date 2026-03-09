@@ -14,11 +14,11 @@ use crate::{
         AttachSessionRequest, InstallerResult, LogErrorCountRequest, LogErrorCounts,
         LogReadRequest, LogReadResult, LogSearchRequest, LogSearchResult, LogStats, RankedSession,
         SessionMetadata, SessionPresetKind, SessionPresetResult, SessionResolveResult,
-        SessionStatus, StartSessionRequest, StopSessionRequest, Warning,
+        SessionStatus, StartSessionRequest, StartShellSessionRequest, StopSessionRequest, Warning,
     },
     runtime::{
         RuntimeOptions, attach_tmux_session, build_default_name, list_tmux_panes, refresh_status,
-        start_managed_session, stop_session,
+        start_managed_session, start_shell_session, stop_session,
     },
     storage::SessionStore,
 };
@@ -120,6 +120,10 @@ impl Grepple {
         start_managed_session(&self.store, req)
     }
 
+    pub fn start_shell_session(&self, req: StartShellSessionRequest) -> Result<SessionMetadata> {
+        start_shell_session(&self.store, req)
+    }
+
     pub fn attach_session(&self, req: AttachSessionRequest) -> Result<SessionMetadata> {
         attach_tmux_session(&self.store, req)
     }
@@ -130,7 +134,7 @@ impl Grepple {
             if matches!(
                 session.status,
                 SessionStatus::Running | SessionStatus::Starting
-            ) && session.provider == crate::model::SessionProvider::Managed
+            ) && session.provider.has_process_control()
             {
                 if let Ok(updated) = refresh_status(&self.store, &session.session_id) {
                     *session = updated;
@@ -555,9 +559,16 @@ impl Grepple {
             }
         }
 
-        if session.provider == crate::model::SessionProvider::Managed {
-            score += 35;
-            reasons.push("managed process".to_string());
+        match session.provider {
+            crate::model::SessionProvider::Managed => {
+                score += 35;
+                reasons.push("managed process".to_string());
+            }
+            crate::model::SessionProvider::ShellPty => {
+                score += 30;
+                reasons.push("interactive shell".to_string());
+            }
+            crate::model::SessionProvider::TmuxAttach => {}
         }
 
         let running = matches!(

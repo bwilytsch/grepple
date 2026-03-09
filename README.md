@@ -37,7 +37,13 @@ cargo install --path . --features with-mcp-bin
 
 ## Quick Start
 
-Run a command under Grepple:
+Start a live interactive shell session under Grepple:
+
+```bash
+grepple
+```
+
+Run an explicit command under Grepple:
 
 ```bash
 grepple run --name api -- pnpm dev
@@ -80,6 +86,29 @@ Clear all locally stored session snapshots/logs:
 grepple sessions clear --yes
 ```
 
+## How Grepple Works
+
+Grepple is built around sessions. A session is a local record of a shell, command, or attached
+runtime, with metadata plus log files that Grepple and MCP tools can inspect later.
+
+- `grepple` starts a new interactive shell session on a PTY. Grepple sits between your terminal
+  and the child shell, forwards keyboard input to it, mirrors the rendered output back to your
+  screen, and writes that transcript to the session logs.
+- `grepple run -- <command>` starts a managed non-interactive process. Grepple captures
+  `stdout`/`stderr`, mirrors them in the foreground by default, and can also keep the process in
+  the background with `--detached`.
+- `grepple attach` is the attach/import path for tmux panes. It captures pane output into a
+  Grepple session so the same log-reading tools can inspect it.
+- Each session is stored on disk under Grepple's state directory with `meta.json`, `stdout.log`,
+  `stderr.log`, `combined.log`, and an event history. This gives MCP tools a stable local source
+  of truth instead of depending on a still-open terminal window.
+- Session ranking uses local context like cwd, git worktree, branch, running status, and command
+  labels so agents can usually find the most relevant runtime for the repo they are working in.
+
+In short: Grepple does not just tail random files. It creates or attaches to session sources,
+stores structured local session state, and then lets the CLI and MCP layer read, rank, search,
+and summarize those sessions.
+
 ## Shell Helpers
 
 Generate shell helpers for a short alias (`g`) and run wrapper (`gr`):
@@ -88,6 +117,9 @@ Generate shell helpers for a short alias (`g`) and run wrapper (`gr`):
 grepple shell init zsh
 grepple shell init fish
 ```
+
+`g` maps to bare `grepple`, so it starts a live shell session. `gr` remains the explicit
+`grepple run -- ...` wrapper for one-off commands.
 
 Install for current shell session:
 
