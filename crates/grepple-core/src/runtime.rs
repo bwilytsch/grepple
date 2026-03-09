@@ -223,7 +223,7 @@ pub fn start_shell_session(
         .and_then(|value| value.to_str())
         .unwrap_or("shell")
         .to_string();
-    let shell_command = format!("{} -i -l", shell_name);
+    let shell_command = format!("{} -i", shell_name);
     let auto_name = build_default_name(req.name.clone(), &cwd, None, Some(&shell_command));
     let slug = format!(
         "{}-{}",
@@ -231,7 +231,7 @@ pub fn start_shell_session(
         &session_id[..4].to_lowercase()
     );
 
-    let (pid, master_fd) = spawn_shell_pty(&shell, &cwd)?;
+    let (pid, master_fd) = spawn_shell_pty(&shell, &cwd, &session_id)?;
 
     let mut stdout_marker = OpenOptions::new().append(true).open(&stdout_path)?;
     let mut combined_marker = OpenOptions::new().append(true).open(&combined_path)?;
@@ -631,7 +631,7 @@ fn resolve_shell() -> String {
         .unwrap_or_else(|| "/bin/sh".to_string())
 }
 
-fn spawn_shell_pty(shell: &str, cwd: &str) -> Result<(i32, i32)> {
+fn spawn_shell_pty(shell: &str, cwd: &str, session_id: &str) -> Result<(i32, i32)> {
     let shell_path = CString::new(shell)
         .map_err(|_| GreppleError::InvalidArgument("shell path contains NUL byte".to_string()))?;
     let shell_name = Path::new(shell)
@@ -642,9 +642,13 @@ fn spawn_shell_pty(shell: &str, cwd: &str) -> Result<(i32, i32)> {
     let argv0 = CString::new(shell_name)
         .map_err(|_| GreppleError::InvalidArgument("shell name contains NUL byte".to_string()))?;
     let arg_interactive = CString::new("-i").expect("static string");
-    let arg_login = CString::new("-l").expect("static string");
     let cwd_cstr = CString::new(cwd)
         .map_err(|_| GreppleError::InvalidArgument("cwd contains NUL byte".to_string()))?;
+    let grepple_shell_name = CString::new("GREPPLE_SHELL").expect("static string");
+    let grepple_shell_value = CString::new("1").expect("static string");
+    let grepple_session_name = CString::new("GREPPLE_SHELL_SESSION_ID").expect("static string");
+    let grepple_session_value = CString::new(session_id)
+        .map_err(|_| GreppleError::InvalidArgument("session id contains NUL byte".to_string()))?;
 
     let mut master_fd = 0;
     let mut termios = current_terminal_mode().ok();
@@ -671,12 +675,18 @@ fn spawn_shell_pty(shell: &str, cwd: &str) -> Result<(i32, i32)> {
             if libc::chdir(cwd_cstr.as_ptr()) != 0 {
                 libc::_exit(1);
             }
-            let argv = [
-                argv0.as_ptr(),
-                arg_interactive.as_ptr(),
-                arg_login.as_ptr(),
-                ptr::null(),
-            ];
+            if libc::setenv(grepple_shell_name.as_ptr(), grepple_shell_value.as_ptr(), 1) != 0 {
+                libc::_exit(1);
+            }
+            if libc::setenv(
+                grepple_session_name.as_ptr(),
+                grepple_session_value.as_ptr(),
+                1,
+            ) != 0
+            {
+                libc::_exit(1);
+            }
+            let argv = [argv0.as_ptr(), arg_interactive.as_ptr(), ptr::null()];
             libc::execvp(shell_path.as_ptr(), argv.as_ptr());
             libc::_exit(127);
         }

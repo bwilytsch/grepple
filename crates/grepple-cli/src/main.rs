@@ -475,14 +475,33 @@ fn print_shell_command(command: &ShellCommands) {
 fn shell_init_snippet(shell: ShellFlavor) -> &'static str {
     match shell {
         ShellFlavor::Zsh => {
-            r#"alias g="grepple"
-gr() { grepple run -- "$@"; }
+            r#"grepple() {
+    if [[ "${GREPPLE_SHELL:-}" = "1" ]]; then
+        case "$1" in
+            exit|quit)
+                builtin exit
+                ;;
+        esac
+    fi
+    command grepple "$@"
+}
+alias g="grepple"
+gr() { command grepple run -- "$@"; }
 "#
         }
         ShellFlavor::Fish => {
-            r#"alias g grepple
+            r#"function grepple
+    if test "$GREPPLE_SHELL" = "1"
+        switch "$argv[1]"
+            case exit quit
+                builtin exit
+        end
+    end
+    command grepple $argv
+end
+alias g grepple
 function gr
-    grepple run -- $argv
+    command grepple run -- $argv
 end
 "#
         }
@@ -626,15 +645,19 @@ mod tests {
     #[test]
     fn shell_init_zsh_contains_alias_and_helper() {
         let snippet = shell_init_snippet(ShellFlavor::Zsh);
+        assert!(snippet.contains("grepple() {"));
+        assert!(snippet.contains("exit|quit"));
         assert!(snippet.contains("alias g=\"grepple\""));
-        assert!(snippet.contains("gr() { grepple run -- \"$@\"; }"));
+        assert!(snippet.contains("gr() { command grepple run -- \"$@\"; }"));
     }
 
     #[test]
     fn shell_init_fish_contains_alias_and_helper() {
         let snippet = shell_init_snippet(ShellFlavor::Fish);
+        assert!(snippet.contains("function grepple"));
+        assert!(snippet.contains("case exit quit"));
         assert!(snippet.contains("alias g grepple"));
         assert!(snippet.contains("function gr"));
-        assert!(snippet.contains("grepple run -- $argv"));
+        assert!(snippet.contains("command grepple run -- $argv"));
     }
 }
