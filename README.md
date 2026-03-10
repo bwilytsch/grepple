@@ -44,7 +44,8 @@ grepple
 ```
 
 Leave that shell the normal way with `exit` or `Ctrl-D`. If you have the shell helpers installed,
-`grepple exit` and `grepple quit` also map to shell exit while you are inside a Grepple shell.
+`grepple exit` and `grepple quit` also tear down shell jobs before exiting while you are inside a
+Grepple shell.
 
 Run an explicit command under Grepple:
 
@@ -123,7 +124,7 @@ grepple shell init fish
 
 `g` maps to bare `grepple`, so it starts a live shell session. `gr` remains the explicit
 `grepple run -- ...` wrapper for one-off commands. Inside a Grepple shell, the helper also makes
-`grepple exit`, `grepple quit`, `g exit`, and `g quit` resolve to the normal shell exit.
+`grepple exit`, `grepple quit`, `g exit`, and `g quit` tear down shell jobs and resolve to exit.
 
 Install for current shell session:
 

@@ -475,11 +475,26 @@ fn print_shell_command(command: &ShellCommands) {
 fn shell_init_snippet(shell: ShellFlavor) -> &'static str {
     match shell {
         ShellFlavor::Zsh => {
-            r#"grepple() {
+            r#"_grepple_shell_exit() {
+    unsetopt checkjobs
+    local pids
+    pids=(${(f)$(command pgrep -P $$ 2>/dev/null)})
+    if (( ${#pids[@]} )); then
+        command kill -HUP $pids 2>/dev/null
+        command sleep 0.15
+        command kill -TERM $pids 2>/dev/null
+        command sleep 0.3
+        command kill -KILL $pids 2>/dev/null
+        wait $pids 2>/dev/null
+    fi
+    builtin exit 0
+}
+grepple() {
     if [[ "${GREPPLE_SHELL:-}" = "1" ]]; then
         case "$1" in
             exit|quit)
-                builtin exit
+                _grepple_shell_exit
+                return $?
                 ;;
         esac
     fi
@@ -490,11 +505,24 @@ gr() { command grepple run -- "$@"; }
 "#
         }
         ShellFlavor::Fish => {
-            r#"function grepple
+            r#"function _grepple_shell_exit
+    set pids (jobs -p)
+    if test (count $pids) -gt 0
+        command kill -HUP $pids 2>/dev/null
+        command sleep 0.15
+        command kill -TERM $pids 2>/dev/null
+        command sleep 0.3
+        command kill -KILL $pids 2>/dev/null
+        wait $pids 2>/dev/null
+    end
+    builtin exit 0
+end
+function grepple
     if test "$GREPPLE_SHELL" = "1"
         switch "$argv[1]"
             case exit quit
-                builtin exit
+                _grepple_shell_exit
+                return $status
         end
     end
     command grepple $argv
@@ -645,6 +673,10 @@ mod tests {
     #[test]
     fn shell_init_zsh_contains_alias_and_helper() {
         let snippet = shell_init_snippet(ShellFlavor::Zsh);
+        assert!(snippet.contains("_grepple_shell_exit() {"));
+        assert!(snippet.contains("unsetopt checkjobs"));
+        assert!(snippet.contains("pgrep -P $$"));
+        assert!(snippet.contains("wait $pids 2>/dev/null"));
         assert!(snippet.contains("grepple() {"));
         assert!(snippet.contains("exit|quit"));
         assert!(snippet.contains("alias g=\"grepple\""));
@@ -654,6 +686,9 @@ mod tests {
     #[test]
     fn shell_init_fish_contains_alias_and_helper() {
         let snippet = shell_init_snippet(ShellFlavor::Fish);
+        assert!(snippet.contains("function _grepple_shell_exit"));
+        assert!(snippet.contains("jobs -p"));
+        assert!(snippet.contains("wait $pids 2>/dev/null"));
         assert!(snippet.contains("function grepple"));
         assert!(snippet.contains("case exit quit"));
         assert!(snippet.contains("alias g grepple"));

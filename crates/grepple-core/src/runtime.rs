@@ -232,6 +232,7 @@ pub fn start_shell_session(
     );
 
     let (pid, master_fd) = spawn_shell_pty(&shell, &cwd, &session_id)?;
+    let shell_tty = tty_for_pid(pid);
 
     let mut stdout_marker = OpenOptions::new().append(true).open(&stdout_path)?;
     let mut combined_marker = OpenOptions::new().append(true).open(&combined_path)?;
@@ -281,6 +282,7 @@ pub fn start_shell_session(
         }),
     )?;
 
+    let mut tracked_descendants = Vec::new();
     let run_result = {
         let _terminal_guard = TerminalModeGuard::enter()?;
         sync_pty_window_size(master_fd)?;
@@ -291,13 +293,20 @@ pub fn start_shell_session(
             master_fd,
             &stdout_path,
             &combined_path,
+            &mut tracked_descendants,
         )
     };
     restore_terminal_state();
     let _ = unsafe { libc::close(master_fd) };
 
     match run_result {
-        Ok(status_raw) => mark_session_exited(store, &session_id, ExitStatus::from_raw(status_raw)),
+        Ok(status_raw) => {
+            teardown_processes(&tracked_descendants, 150, 300);
+            if let Some(shell_tty) = shell_tty.as_deref() {
+                teardown_shell_tty(shell_tty);
+            }
+            mark_session_exited(store, &session_id, ExitStatus::from_raw(status_raw))
+        }
         Err(err) => {
             let _ = signal_process_group(pid, libc::SIGTERM);
             if let Ok(status_raw) = wait_for_pid(pid) {
@@ -441,14 +450,32 @@ pub fn stop_session(
         req.grace_ms
     };
 
-    let _ = signal_process_group(pid, libc::SIGINT);
-    thread::sleep(Duration::from_millis(grace_ms));
-    if is_process_alive(pid) {
-        let _ = signal_process_group(pid, libc::SIGTERM);
-        thread::sleep(Duration::from_millis(300));
-    }
-    if is_process_alive(pid) {
-        let _ = signal_process_group(pid, libc::SIGKILL);
+    if matches!(meta.provider, SessionProvider::ShellPty) {
+        let descendants = process_descendants(pid);
+        teardown_processes(&descendants, grace_ms, 300);
+        if let Some(shell_tty) = tty_for_pid(pid) {
+            teardown_shell_tty_with_delays(&shell_tty, grace_ms, 300);
+        } else {
+            let _ = signal_process_group(pid, libc::SIGINT);
+            thread::sleep(Duration::from_millis(grace_ms));
+            if is_process_alive(pid) {
+                let _ = signal_process_group(pid, libc::SIGTERM);
+                thread::sleep(Duration::from_millis(300));
+            }
+            if is_process_alive(pid) {
+                let _ = signal_process_group(pid, libc::SIGKILL);
+            }
+        }
+    } else {
+        let _ = signal_process_group(pid, libc::SIGINT);
+        thread::sleep(Duration::from_millis(grace_ms));
+        if is_process_alive(pid) {
+            let _ = signal_process_group(pid, libc::SIGTERM);
+            thread::sleep(Duration::from_millis(300));
+        }
+        if is_process_alive(pid) {
+            let _ = signal_process_group(pid, libc::SIGKILL);
+        }
     }
 
     meta.status = SessionStatus::Stopped;
@@ -702,13 +729,20 @@ fn pump_shell_pty(
     master_fd: i32,
     stdout_path: &Path,
     combined_path: &Path,
+    tracked_descendants: &mut Vec<i32>,
 ) -> Result<i32> {
     let mut stdout_file = OpenOptions::new().append(true).open(stdout_path)?;
     let mut combined_file = OpenOptions::new().append(true).open(combined_path)?;
     let mut buffer = [0_u8; 8192];
     let mut last_touch = Instant::now() - Duration::from_secs(2);
+    let mut last_process_scan = Instant::now() - Duration::from_secs(1);
 
     loop {
+        if last_process_scan.elapsed() >= Duration::from_millis(250) {
+            *tracked_descendants = process_descendants(pid);
+            last_process_scan = Instant::now();
+        }
+
         let _ = sync_pty_window_size(master_fd);
 
         let mut fds = [
@@ -894,6 +928,160 @@ fn signal_process_group(pid: i32, signal: i32) -> Result<()> {
         return Ok(());
     }
     Err(err.into())
+}
+
+fn signal_pid(pid: i32, signal: i32) -> Result<()> {
+    let rc = unsafe { libc::kill(pid, signal) };
+    if rc == 0 {
+        return Ok(());
+    }
+
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(());
+    }
+    Err(err.into())
+}
+
+fn process_descendants(root_pid: i32) -> Vec<i32> {
+    if root_pid <= 0 {
+        return Vec::new();
+    }
+
+    let output = match Command::new("ps").arg("-axo").arg("pid=,ppid=").output() {
+        Ok(output) => output,
+        Err(_) => return Vec::new(),
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+
+    let mut parent_pairs = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut parts = line.split_whitespace();
+        let pid = match parts.next().and_then(|value| value.parse::<i32>().ok()) {
+            Some(pid) if pid > 0 => pid,
+            _ => continue,
+        };
+        let ppid = match parts.next().and_then(|value| value.parse::<i32>().ok()) {
+            Some(ppid) if ppid >= 0 => ppid,
+            _ => continue,
+        };
+        parent_pairs.push((pid, ppid));
+    }
+
+    let mut descendants = Vec::new();
+    let mut frontier = vec![root_pid];
+    while let Some(parent_pid) = frontier.pop() {
+        for (pid, ppid) in &parent_pairs {
+            if *ppid == parent_pid && !descendants.contains(pid) {
+                descendants.push(*pid);
+                frontier.push(*pid);
+            }
+        }
+    }
+
+    descendants
+}
+
+fn teardown_processes(pids: &[i32], sighup_delay_ms: u64, sigterm_delay_ms: u64) {
+    let mut tracked = pids
+        .iter()
+        .copied()
+        .filter(|pid| *pid > 0)
+        .collect::<Vec<_>>();
+    tracked.sort_unstable();
+    tracked.dedup();
+
+    for (signal, delay_ms) in [
+        (libc::SIGHUP, sighup_delay_ms),
+        (libc::SIGTERM, sigterm_delay_ms),
+        (libc::SIGKILL, 0_u64),
+    ] {
+        tracked.retain(|pid| is_process_alive(*pid));
+        if tracked.is_empty() {
+            break;
+        }
+
+        for pid in &tracked {
+            let _ = signal_pid(*pid, signal);
+        }
+        if delay_ms > 0 {
+            thread::sleep(Duration::from_millis(delay_ms));
+        }
+    }
+}
+
+fn tty_for_pid(pid: i32) -> Option<String> {
+    if pid <= 0 {
+        return None;
+    }
+
+    let output = Command::new("ps")
+        .arg("-o")
+        .arg("tty=")
+        .arg("-p")
+        .arg(pid.to_string())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let tty = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if tty.is_empty() || tty == "??" {
+        None
+    } else {
+        Some(tty)
+    }
+}
+
+fn process_ids_on_tty(tty: &str) -> Vec<i32> {
+    if tty.trim().is_empty() {
+        return Vec::new();
+    }
+
+    let output = match Command::new("ps").arg("-axo").arg("pid=,tty=").output() {
+        Ok(output) => output,
+        Err(_) => return Vec::new(),
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let pid = parts.next()?.parse::<i32>().ok()?;
+            let process_tty = parts.next()?;
+            (process_tty == tty && pid > 0).then_some(pid)
+        })
+        .collect()
+}
+
+fn teardown_shell_tty(tty: &str) {
+    teardown_shell_tty_with_delays(tty, 150, 300);
+}
+
+fn teardown_shell_tty_with_delays(tty: &str, sighup_delay_ms: u64, sigterm_delay_ms: u64) {
+    for (signal, delay_ms) in [
+        (libc::SIGHUP, sighup_delay_ms),
+        (libc::SIGTERM, sigterm_delay_ms),
+        (libc::SIGKILL, 0_u64),
+    ] {
+        let pids = process_ids_on_tty(tty);
+        if pids.is_empty() {
+            break;
+        }
+
+        for pid in pids {
+            let _ = signal_pid(pid, signal);
+        }
+        if delay_ms > 0 {
+            thread::sleep(Duration::from_millis(delay_ms));
+        }
+    }
 }
 
 fn is_process_alive(pid: i32) -> bool {
