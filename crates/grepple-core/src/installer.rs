@@ -14,6 +14,7 @@ use crate::{
 pub enum Client {
     Codex,
     Claude,
+    ClaudeSkill,
     Opencode,
 }
 
@@ -22,6 +23,7 @@ impl Client {
         match input {
             "codex" => Ok(Self::Codex),
             "claude" => Ok(Self::Claude),
+            "claude-skill" => Ok(Self::ClaudeSkill),
             "opencode" => Ok(Self::Opencode),
             _ => Err(GreppleError::InvalidArgument(format!(
                 "unsupported client: {input}"
@@ -33,6 +35,7 @@ impl Client {
         match self {
             Self::Codex => "codex",
             Self::Claude => "claude",
+            Self::ClaudeSkill => "claude-skill",
             Self::Opencode => "opencode",
         }
     }
@@ -53,6 +56,7 @@ pub fn install(req: InstallRequest) -> Result<InstallerResult> {
     match req.client {
         Client::Codex => install_codex(req),
         Client::Claude => install_claude(req),
+        Client::ClaudeSkill => install_claude_skill(req),
         Client::Opencode => install_opencode(req),
     }
 }
@@ -207,6 +211,143 @@ fn install_claude(req: InstallRequest) -> Result<InstallerResult> {
         success,
         details,
     })
+}
+
+fn install_claude_skill(req: InstallRequest) -> Result<InstallerResult> {
+    let skill_dir = match req.scope.as_str() {
+        "user" => dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("~"))
+            .join(".claude")
+            .join("commands"),
+        "project" => req.cwd.join(".claude").join("commands"),
+        _ => {
+            return Err(GreppleError::InvalidArgument(format!(
+                "unsupported scope '{}' for claude-skill (use 'user' or 'project')",
+                req.scope
+            )));
+        }
+    };
+
+    let skill_path = skill_dir.join(format!("{}.md", req.name));
+
+    let plan = InstallerPlan {
+        client: "claude-skill".to_string(),
+        description: format!(
+            "Install grepple CLI skill into Claude Code ({} scope)",
+            req.scope
+        ),
+        command_preview: None,
+        config_path: Some(skill_path.display().to_string()),
+    };
+
+    if req.dry_run {
+        return Ok(InstallerResult {
+            client: "claude-skill".to_string(),
+            dry_run: true,
+            plan,
+            success: true,
+            details: "dry run".to_string(),
+        });
+    }
+
+    if skill_path.exists() && !req.force {
+        return Err(GreppleError::Tool(format!(
+            "skill file already exists at {} (use --force to overwrite)",
+            skill_path.display()
+        )));
+    }
+
+    fs::create_dir_all(&skill_dir)?;
+    fs::write(&skill_path, claude_skill_content())?;
+
+    Ok(InstallerResult {
+        client: "claude-skill".to_string(),
+        dry_run: false,
+        plan,
+        success: true,
+        details: format!("wrote {}", skill_path.display()),
+    })
+}
+
+fn claude_skill_content() -> &'static str {
+    r#"---
+description: Check live local logs, dev server output, runtime errors, and stack traces using grepple
+---
+
+Use grepple CLI to inspect live local sessions: dev servers, backend/frontend runtimes,
+startup failures, and stack traces. Prefer grepple session discovery before code search
+when asked about logs, errors, servers, or stack traces.
+
+User's request: $ARGUMENTS
+
+## Workflow
+
+### 1. Discover sessions
+
+List all sessions as JSON:
+
+```bash
+grepple sessions --json
+```
+
+From the output, find the most relevant session by:
+
+- **Status**: prefer `running` > `starting` > `crashed`/`failed` > `stopped`
+- **Git context**: match `git_context.repo_root` or `git_context.worktree_root` to the current repo
+- **Labels**: match labels like `dev-server`, `frontend`, `backend`, `next`, `vite`, `flask` to the user's intent
+- **Recency**: prefer sessions with the most recent `last_activity_at`
+
+If no sessions exist or none match the current repo, tell the user. Suggest starting one
+with `grepple run` if appropriate.
+
+### 2. Read logs
+
+Tail recent output:
+
+```bash
+grepple logs <session_id> --tail 50
+```
+
+Search for errors:
+
+```bash
+grepple logs <session_id> --search "error|Error|ERROR|panic|PANIC|fatal|FATAL|exception|Exception|fail|FAIL|traceback|Traceback" --regex
+```
+
+Read a specific byte range (for incremental reading of large logs):
+
+```bash
+grepple logs <session_id> --stream combined --offset <byte_offset> --max-bytes 32768
+```
+
+Use `next_offset` from the output to continue reading from where you left off.
+
+### 3. Session management
+
+Start a command in the background:
+
+```bash
+grepple run --detached --name <name> -- <command>
+```
+
+Start a command in the foreground (mirrors output to terminal):
+
+```bash
+grepple run --name <name> -- <command>
+```
+
+Stop a session:
+
+```bash
+grepple stop <session_id>
+```
+
+## Response guidelines
+
+- Answer the user's question directly first (Yes/No when applicable)
+- For simple factual questions, respond in one sentence with minimum evidence
+- Do not mention session IDs or internal details unless the user asks
+"#
 }
 
 fn install_opencode(req: InstallRequest) -> Result<InstallerResult> {

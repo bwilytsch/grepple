@@ -6,6 +6,7 @@ backend/frontend runtimes, startup failures, and stack traces.
 
 It provides:
 - a CLI (`grepple`) for starting/attaching sessions and reading logs
+- a skill file (`SKILL.md`) for Claude Code — CLI-only, no MCP server needed
 - an MCP stdio server (`grepple mcp` or `grepple-mcp`) exposing structured tools
 - first-party installer helpers for `codex`, `claude`, and `opencode`
 
@@ -144,6 +145,32 @@ Persist in shell config:
 grepple shell init zsh >> ~/.zshrc
 grepple shell init fish >> ~/.config/fish/config.fish
 ```
+
+## CLI + Skill (Claude Code)
+
+Instead of running grepple as an MCP server, you can use the CLI directly through a
+Claude Code skill file. Claude runs `grepple` commands via Bash, guided by the skill
+instructions. This is simpler to set up — no MCP server process, no stdio protocol.
+
+Install the skill:
+
+```bash
+grepple install claude-skill --scope user
+```
+
+This writes the skill file to `~/.claude/commands/grepple.md`. Use `--scope project` to
+install into the current project's `.claude/commands/` instead.
+
+Use it in Claude Code:
+
+```
+/grepple check for errors on the dev server
+/grepple show me the last 50 lines of the api logs
+/grepple what's running in this repo
+```
+
+The skill teaches Claude how to discover sessions, read/search logs, and manage
+processes using the same `grepple` CLI commands documented above.
 
 ## Install MCP Into Clients
 
