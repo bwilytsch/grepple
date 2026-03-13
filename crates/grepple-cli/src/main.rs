@@ -111,6 +111,17 @@ enum Commands {
         #[arg(long, action = ArgAction::SetTrue)]
         json: bool,
     },
+    Uninstall {
+        client: String,
+        #[arg(long, default_value = "grepple")]
+        name: String,
+        #[arg(long, action = ArgAction::SetTrue)]
+        dry_run: bool,
+        #[arg(long, default_value = "user")]
+        scope: String,
+        #[arg(long, action = ArgAction::SetTrue)]
+        json: bool,
+    },
     Shell {
         #[command(subcommand)]
         command: ShellCommands,
@@ -339,6 +350,23 @@ fn run() -> Result<()> {
                 anyhow::bail!("installer failed: {}", out.details);
             }
         }
+        Some(Commands::Uninstall {
+            client,
+            name,
+            dry_run,
+            scope,
+            json,
+        }) => {
+            let out = app.uninstall_client(&client, &name, dry_run, &scope)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&out)?);
+            } else {
+                print_uninstall_summary(&out, &name);
+            }
+            if !out.success {
+                anyhow::bail!("uninstall failed: {}", out.details);
+            }
+        }
         Some(Commands::Shell { .. }) => unreachable!("handled before app initialization"),
         Some(Commands::Mcp) => unreachable!("handled before app initialization"),
     }
@@ -435,6 +463,29 @@ fn print_install_summary(out: &InstallerResult, configured_name: &str) {
         }
     } else {
         println!("Grepple MCP install failed for {}.", out.client);
+    }
+
+    if let Some(preview) = &out.plan.command_preview {
+        println!("Command: {}", preview);
+    }
+    if let Some(path) = &out.plan.config_path {
+        println!("Config: {}", path);
+    }
+    println!("Details: {}", out.details);
+}
+
+fn print_uninstall_summary(out: &InstallerResult, configured_name: &str) {
+    if out.success {
+        if out.dry_run {
+            println!("Dry run for {} uninstall complete.", out.client);
+        } else {
+            println!(
+                "Uninstalled Grepple for {} as '{}'.",
+                out.client, configured_name
+            );
+        }
+    } else {
+        println!("Grepple uninstall failed for {}.", out.client);
     }
 
     if let Some(preview) = &out.plan.command_preview {

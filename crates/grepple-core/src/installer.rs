@@ -52,6 +52,24 @@ pub struct InstallRequest {
     pub cwd: PathBuf,
 }
 
+#[derive(Debug, Clone)]
+pub struct UninstallRequest {
+    pub client: Client,
+    pub name: String,
+    pub dry_run: bool,
+    pub scope: String,
+    pub cwd: PathBuf,
+}
+
+pub fn uninstall(req: UninstallRequest) -> Result<InstallerResult> {
+    match req.client {
+        Client::Codex => uninstall_codex(req),
+        Client::Claude => uninstall_claude(req),
+        Client::ClaudeSkill => uninstall_claude_skill(req),
+        Client::Opencode => uninstall_opencode(req),
+    }
+}
+
 pub fn install(req: InstallRequest) -> Result<InstallerResult> {
     match req.client {
         Client::Codex => install_codex(req),
@@ -455,6 +473,279 @@ fn install_opencode(req: InstallRequest) -> Result<InstallerResult> {
         plan,
         success: true,
         details: format!("updated {}", config_path.display()),
+    })
+}
+
+fn uninstall_codex(req: UninstallRequest) -> Result<InstallerResult> {
+    let preview = format!("codex mcp remove {}", req.name);
+    let config_path = codex_config_path();
+
+    let plan = InstallerPlan {
+        client: "codex".to_string(),
+        description: "Remove grepple MCP from codex config".to_string(),
+        command_preview: Some(preview.clone()),
+        config_path: Some(config_path.display().to_string()),
+    };
+
+    if req.dry_run {
+        return Ok(InstallerResult {
+            client: "codex".to_string(),
+            dry_run: true,
+            plan,
+            success: true,
+            details: "dry run".to_string(),
+        });
+    }
+
+    let output = Command::new("codex")
+        .arg("mcp")
+        .arg("remove")
+        .arg(&req.name)
+        .output()?;
+
+    let cmd_success = output.status.success();
+    let mut details = if cmd_success {
+        "codex mcp remove succeeded".to_string()
+    } else {
+        String::from_utf8_lossy(&output.stderr).to_string()
+    };
+
+    if config_path.exists() {
+        match remove_codex_startup_timeout(&req.name) {
+            Ok(true) => {
+                details.push_str("; removed startup_timeout_sec from config.toml");
+            }
+            Ok(false) => {}
+            Err(err) => {
+                details.push_str(&format!(
+                    "; warning: failed to clean startup_timeout_sec: {err}"
+                ));
+            }
+        }
+    }
+
+    Ok(InstallerResult {
+        client: "codex".to_string(),
+        dry_run: false,
+        plan,
+        success: cmd_success,
+        details,
+    })
+}
+
+fn remove_codex_startup_timeout(server_name: &str) -> Result<bool> {
+    let config_path = codex_config_path();
+    if !config_path.exists() {
+        return Ok(false);
+    }
+
+    let content = fs::read_to_string(&config_path)?;
+    let mut doc = content
+        .parse::<DocumentMut>()
+        .map_err(|e| GreppleError::Tool(format!("invalid codex toml config: {e}")))?;
+
+    if !doc["mcp_servers"].is_table() {
+        return Ok(false);
+    }
+    if !doc["mcp_servers"][server_name].is_table() {
+        return Ok(false);
+    }
+
+    doc["mcp_servers"]
+        .as_table_mut()
+        .expect("table")
+        .remove(server_name);
+
+    let tmp = config_path.with_extension("tmp");
+    fs::write(&tmp, doc.to_string())?;
+    fs::rename(&tmp, &config_path)?;
+    Ok(true)
+}
+
+fn uninstall_claude(req: UninstallRequest) -> Result<InstallerResult> {
+    let preview = format!("claude mcp remove --scope {} {}", req.scope, req.name);
+
+    let plan = InstallerPlan {
+        client: "claude".to_string(),
+        description: "Remove grepple MCP from claude code config".to_string(),
+        command_preview: Some(preview.clone()),
+        config_path: None,
+    };
+
+    if req.dry_run {
+        return Ok(InstallerResult {
+            client: "claude".to_string(),
+            dry_run: true,
+            plan,
+            success: true,
+            details: "dry run".to_string(),
+        });
+    }
+
+    let output = Command::new("claude")
+        .arg("mcp")
+        .arg("remove")
+        .arg("--scope")
+        .arg(&req.scope)
+        .arg(&req.name)
+        .output()?;
+
+    let success = output.status.success();
+    let details = if success {
+        "claude mcp remove succeeded".to_string()
+    } else {
+        String::from_utf8_lossy(&output.stderr).to_string()
+    };
+
+    Ok(InstallerResult {
+        client: "claude".to_string(),
+        dry_run: false,
+        plan,
+        success,
+        details,
+    })
+}
+
+fn uninstall_claude_skill(req: UninstallRequest) -> Result<InstallerResult> {
+    let skill_path = match req.scope.as_str() {
+        "user" => dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("~"))
+            .join(".claude")
+            .join("commands")
+            .join(format!("{}.md", req.name)),
+        "project" => req
+            .cwd
+            .join(".claude")
+            .join("commands")
+            .join(format!("{}.md", req.name)),
+        _ => {
+            return Err(GreppleError::InvalidArgument(format!(
+                "unsupported scope '{}' for claude-skill (use 'user' or 'project')",
+                req.scope
+            )));
+        }
+    };
+
+    let plan = InstallerPlan {
+        client: "claude-skill".to_string(),
+        description: format!(
+            "Remove grepple CLI skill from Claude Code ({} scope)",
+            req.scope
+        ),
+        command_preview: None,
+        config_path: Some(skill_path.display().to_string()),
+    };
+
+    if req.dry_run {
+        return Ok(InstallerResult {
+            client: "claude-skill".to_string(),
+            dry_run: true,
+            plan,
+            success: true,
+            details: "dry run".to_string(),
+        });
+    }
+
+    if !skill_path.exists() {
+        return Ok(InstallerResult {
+            client: "claude-skill".to_string(),
+            dry_run: false,
+            plan,
+            success: true,
+            details: "skill file not found, nothing to remove".to_string(),
+        });
+    }
+
+    fs::remove_file(&skill_path)?;
+
+    Ok(InstallerResult {
+        client: "claude-skill".to_string(),
+        dry_run: false,
+        plan,
+        success: true,
+        details: format!("removed {}", skill_path.display()),
+    })
+}
+
+fn uninstall_opencode(req: UninstallRequest) -> Result<InstallerResult> {
+    let config_path = SessionStore::opencode_config_path(&req.scope, &req.cwd);
+    let instructions_name = "grepple-opencode-instructions.md";
+    let instructions_path = config_path
+        .parent()
+        .unwrap_or_else(|| req.cwd.as_path())
+        .join(instructions_name);
+
+    let plan = InstallerPlan {
+        client: "opencode".to_string(),
+        description: "Remove grepple MCP entry and instructions from OpenCode config".to_string(),
+        command_preview: None,
+        config_path: Some(config_path.display().to_string()),
+    };
+
+    if req.dry_run {
+        return Ok(InstallerResult {
+            client: "opencode".to_string(),
+            dry_run: true,
+            plan,
+            success: true,
+            details: "dry run".to_string(),
+        });
+    }
+
+    if !config_path.exists() {
+        return Ok(InstallerResult {
+            client: "opencode".to_string(),
+            dry_run: false,
+            plan,
+            success: true,
+            details: "config not found, nothing to remove".to_string(),
+        });
+    }
+
+    let content = fs::read_to_string(&config_path)?;
+    let mut root = serde_json::from_str::<Value>(&content)
+        .map_err(|e| GreppleError::Tool(format!("invalid opencode json config: {e}")))?;
+
+    let mut changed = false;
+
+    if let Some(mcp) = root.get_mut("mcp").and_then(Value::as_object_mut) {
+        if mcp.remove(&req.name).is_some() {
+            changed = true;
+        }
+    }
+
+    if let Some(instructions) = root.get_mut("instructions").and_then(Value::as_array_mut) {
+        let before = instructions.len();
+        instructions.retain(|item| item.as_str() != Some(instructions_name));
+        if instructions.len() != before {
+            changed = true;
+        }
+    }
+
+    if changed {
+        let backup =
+            config_path.with_extension(format!("bak-{}", Utc::now().format("%Y%m%d%H%M%S")));
+        fs::copy(&config_path, &backup)?;
+
+        let tmp = config_path.with_extension("tmp");
+        fs::write(&tmp, serde_json::to_string_pretty(&root)?)?;
+        fs::rename(&tmp, &config_path)?;
+    }
+
+    if instructions_path.exists() {
+        fs::remove_file(&instructions_path)?;
+    }
+
+    Ok(InstallerResult {
+        client: "opencode".to_string(),
+        dry_run: false,
+        plan,
+        success: true,
+        details: if changed {
+            format!("updated {}", config_path.display())
+        } else {
+            "grepple entry not found in config, nothing to remove".to_string()
+        },
     })
 }
 

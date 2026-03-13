@@ -202,6 +202,20 @@ grepple install opencode --scope user
 `grepple install opencode` now also adds a small instruction file so OpenCode prefers
 Grepple first for logs/errors/server/dev-server questions before broad code search.
 
+## Uninstall
+
+Remove grepple from any client:
+
+```bash
+grepple uninstall codex
+grepple uninstall claude --scope user
+grepple uninstall claude-skill --scope user
+grepple uninstall opencode --scope user
+```
+
+Each uninstall reverses what its corresponding install did — removes the MCP entry,
+config keys, skill files, and instruction files. Use `--dry-run` to preview.
+
 ## MCP Entry Point
 
 Run the server over stdio (default):

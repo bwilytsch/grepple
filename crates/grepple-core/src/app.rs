@@ -8,7 +8,7 @@ use regex::Regex;
 
 use crate::{
     error::{GreppleError, Result},
-    installer::{Client, InstallRequest, install},
+    installer::{Client, InstallRequest, UninstallRequest, install, uninstall},
     log_ops,
     model::{
         AttachSessionRequest, InstallerResult, LogErrorCountRequest, LogErrorCounts,
@@ -462,6 +462,24 @@ impl Grepple {
             env,
             dry_run,
             force,
+            scope: scope.to_string(),
+            cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        })
+    }
+
+    pub fn uninstall_client(
+        &self,
+        client: &str,
+        name: &str,
+        dry_run: bool,
+        scope: &str,
+    ) -> Result<InstallerResult> {
+        let client = Client::parse(client)?;
+
+        uninstall(UninstallRequest {
+            client,
+            name: name.to_string(),
+            dry_run,
             scope: scope.to_string(),
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         })
